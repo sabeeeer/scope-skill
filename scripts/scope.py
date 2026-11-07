@@ -94,6 +94,26 @@ class Scpi:
         assert self._sock is not None
         self._sock.sendall(cmd.encode("ascii") + b"\n")
 
+    def drain(self, quiet: float = 0.12) -> int:
+        """丢弃滞留的"迟到响应"，防止后续查询整体错位。
+
+        查询超时后仪器往往仍会把响应发过来；不清理的话，下一条查询就会读到上一条的
+        结果（典型症状：把 *IDN? 的字符串当浮点数解析）。
+        """
+        assert self._sock is not None
+        dropped = len(self._buf)
+        self._buf = b""
+        while True:
+            self._sock.settimeout(quiet)
+            try:
+                chunk = self._sock.recv(262144)
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            dropped += len(chunk)
+        return dropped
+
     def read_line(self, timeout: float = DATA_TIMEOUT) -> str:
         """读取一条以换行结束的响应（可能非常长，例如 1.5 MB 的波形文本）。"""
         deadline = time.time() + timeout
@@ -616,6 +636,7 @@ def _png_fallback(png_path: str, times: list[float], cols: list[list[float]],
 # csv 子命令（固定输出：CSV + 波形图 + JSON 元数据）
 # --------------------------------------------------------------------------- #
 def cmd_csv(args, inst: Scpi) -> int:
+    inst.drain(0.05)                    # 清掉可能滞留的响应，避免查询错位
     out_dir = ensure_dir(args.out)
     channels = [int(c) for c in args.channels.split(",") if c.strip()] if args.channels else [1, 2, 3, 4]
 
@@ -652,7 +673,11 @@ def cmd_csv(args, inst: Scpi) -> int:
             inst.write("TIMebase:POSition 0")
 
         if args.mode == "trigger":
-            trig_info = capture_trigger(inst, args)
+            if getattr(args, "already_captured", False):
+                trig_info = getattr(args, "trig_info", None) or {"mode": "trigger"}
+                print("使用已触发采集的画面直接导出（不再重新采集）")
+            else:
+                trig_info = capture_trigger(inst, args)
         else:
             capture_continuous(inst, args.settle)
 
@@ -803,6 +828,340 @@ def percentile(values: list[float], q: float) -> float:
     ordered = sorted(values)
     idx = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
     return ordered[idx]
+
+
+# --------------------------------------------------------------------------- #
+# 常驻等待（watch）：探头还没接时用。先按 NORMal + RUN 预武装触发，
+# 用"不停采集"的测量值感知信号是否到达，越过电平后冻结读数、抓拍截图 + CSV，
+# 再自动量程并按频率选时基后重新武装。探头已接好时直接用 csv/shot 抓一次。
+# --------------------------------------------------------------------------- #
+MEAS_SLOTS = ((1, "RMS"), (2, "FREQuency"), (3, "AMPLitude"), (4, "MEAN"))
+MEAS_INVALID = 1e36            # R&S 用 9.91E+37 表示"无有效结果"
+
+
+def meas_setup(inst: Scpi, ch: int) -> None:
+    """打开 4 个测量位（RMS / 频率 / 幅度 / 均值），源设为目标通道。
+
+    实测：RTB2004 只有 4 个测量位（5/6 报 -114 Header suffix out of range）；
+    `MEASurement<n>:MAIN <类型>` 是**单参数**写法（写成 `CH1,RMS` 会报 -104）；
+    测量框画在波形区下方的状态条里，不遮挡波形，可以一直开着。
+    """
+    for n, typ in MEAS_SLOTS:
+        inst.write(f"MEASurement{n}:SOURce CH{ch}")
+        inst.write(f"MEASurement{n}:MAIN {typ}")
+    time.sleep(0.25)
+
+
+def meas_clear(inst: Scpi) -> None:
+    for n, _ in MEAS_SLOTS:
+        try:
+            inst.write(f"MEASurement{n}:MAIN NONE")
+        except Exception:
+            pass
+
+
+def meas_read(inst: Scpi) -> dict:
+    """读 4 个测量位当前值。全程只查询，不改变采集状态（不打断 RUN）。
+
+    实测：RUN 状态下 `MEASurement<n>:RESult?` 正常返回；返回 9.91E+37 表示无有效结果
+    （例如没有周期信号时的频率/周期测量），统一折算成 None。
+    """
+    out: dict[str, float | None] = {}
+    for n, typ in MEAS_SLOTS:
+        value: float | None = None
+        try:
+            raw = inst.query(f"MEASurement{n}:RESult?", 6.0)
+            value = float(raw)
+        except Exception:
+            value = None
+            inst.drain(0.08)           # 迟到的响应必须清掉，否则后续查询错位
+        if value is None or abs(value) >= MEAS_INVALID:
+            value = None
+        out[typ] = value
+    return out
+
+
+def fmt_meas(value: float | None, unit: str, digits: int = 4) -> str:
+    if value is None:
+        return "--"
+    return f"{value:.{digits}g}{unit}"
+
+
+def wait_autoset_done(inst: Scpi, timeout: float = 12.0) -> None:
+    """等 AUToscale 落定：档位/时基连续两次读回一致即认为完成。"""
+    deadline = time.time() + timeout
+    prev = None
+    time.sleep(1.0)
+    while time.time() < deadline:
+        try:
+            cur = (inst.query("CHANnel1:SCALe?", DEFAULT_TIMEOUT),
+                   inst.query("TIMebase:SCALe?", DEFAULT_TIMEOUT))
+        except Exception:
+            return
+        if prev is not None and cur == prev:
+            return
+        prev = cur
+        time.sleep(0.35)
+
+
+def fit_view(inst: Scpi, args, m: dict | None) -> dict:
+    """自动调好显示：AUToscale 管幅度/偏移，再按实测频率把时基设到 N 个周期。"""
+    info: dict = {"autoscale": False, "timebase_s": None}
+    meas_clear(inst)                      # AUToscale 会清掉测量位，先关再开
+    if not args.no_autoscale:
+        t0 = time.time()
+        inst.write("AUToscale")
+        wait_autoset_done(inst)
+        info["autoscale"] = True
+        info["autoscale_s"] = round(time.time() - t0, 2)
+        print(f"  自动量程完成（{info['autoscale_s']}s）")
+        time.sleep(0.3)
+
+    if m is None:                          # 调用方没有测量值：现在读一次
+        meas_setup(inst, args.channel)
+        time.sleep(0.2)
+        m = meas_read(inst)
+
+    freq = m.get("FREQuency")
+    if args.screen_periods and freq and freq > 1e-3:
+        tb = pick_timebase(1.0 / freq, args.screen_periods)
+        inst.write(f"TIMebase:SCALe {tb:.6g}")
+        inst.write("TIMebase:POSition 0")
+        time.sleep(0.3)
+        actual = float(inst.query("TIMebase:SCALe?", DEFAULT_TIMEOUT))
+        info["timebase_s"] = actual
+        print(f"  按实测 {freq:.6g} Hz 设时基 {actual * 1e6:.4g} µs/div"
+              f"（窗口 {actual * DIVISIONS * 1e3:.4g} ms ≈ {args.screen_periods} 个周期）")
+    elif args.timebase:
+        actual = apply_timebase(inst, parse_seconds(args.timebase))
+        info["timebase_s"] = actual
+
+    meas_setup(inst, args.channel)
+    scale = inst.query_float(f"CHANnel{args.channel}:SCALe?")
+    offset = inst.query_float(f"CHANnel{args.channel}:OFFSet?")
+    info["scale_v_per_div"] = scale
+    info["offset_v"] = offset
+    print(f"  CH{args.channel}: {scale:.6g} V/div, offset {offset:.6g} V")
+    return info
+
+
+def estimate_trigger_level(inst: Scpi, ch: int, m: dict, args) -> tuple[float, str]:
+    """按实测值估触发电平：均值（PWM/方波正好落在高低电平中间）+ 一点 Vpp 偏置。"""
+    if args.trig_level is not None:
+        return float(args.trig_level), "手动指定"
+    mean = m.get("MEAN")
+    ampl = m.get("AMPLitude")
+    level = 0.0 if mean is None else mean
+    basis = "MEAN" if mean is not None else "0V"
+    if ampl and ampl > 0:
+        level += 0.10 * ampl
+        basis = f"MEAN+10%Vpp" if mean is not None else "10%Vpp"
+    scale = inst.query_float(f"CHANnel{ch}:SCALe?")
+    limit = 4.5 * scale                     # 屏幕纵向 10 格，中心 ±5 格，留半格余量
+    if abs(level) > limit:
+        level = limit if level > 0 else -limit
+        basis += "（超出屏幕，已限幅）"
+    return level, basis
+
+
+def arm_trigger(inst: Scpi, ch: int, slope_word: str, level: float) -> dict:
+    """配置边沿触发（EDGE / CH / 沿 / NORMal / 电平）并 RUN 武装。
+
+    实测要点：RTB2004 的 `RUNSingle` 在电平不可达时会**立刻** STOP（不是保持等待），
+    所以"预先武装等信号"只能用 MODE NORMal + RUN —— 不触发就不刷新屏幕，
+    信号一到（越过电平）立即触发并刷新记录。
+    """
+    slope = "POS" if slope_word.lower().startswith("r") else "NEG"
+    inst.write("TRIGger:A:TYPe EDGE")
+    inst.write(f"TRIGger:A:SOURce CH{ch}")
+    inst.write(f"TRIGger:A:EDGE:SLOPe {slope}")
+    inst.write("TRIGger:A:MODE NORMal")
+    inst.write(f"TRIGger:A:LEVel {level:.6g}")
+    time.sleep(0.2)
+    actual = level
+    try:
+        actual = inst.query_float("TRIGger:A:LEVel?")
+    except Exception:
+        pass
+    inst.write("RUN")
+    return {
+        "slope": "rise" if slope == "POS" else "fall",
+        "slope_cmd": slope,
+        "level_v": actual,
+        "state": "RUN",
+        "armed": True,
+    }
+
+
+def level_reachable(m: dict, level: float, min_vpp: float) -> bool:
+    """用测量值判断"当前记录里已经有能跨越触发电平的信号"。"""
+    ampl = m.get("AMPLitude")
+    if ampl is None or ampl < min_vpp:
+        return False
+    mean = m.get("MEAN")
+    if mean is None:
+        return True
+    return (mean - ampl / 2.0) <= level <= (mean + ampl / 2.0)
+
+
+def crossing_ok(values: list[float], level: float, slope_word: str) -> bool:
+    """复核记录里真的越过了触发电平（RUNSingle 在未触发时也可能立刻停，必须验证）。"""
+    if len(values) < 16:
+        return False
+    lo, hi = min(values), max(values)
+    if not (lo <= level <= hi):
+        return False
+    span = max(hi - lo, 1e-12)
+    band = max(span * 0.02, abs(level) * 1e-3, 1e-9)
+    rise = slope_word.lower().startswith("r")
+    for i in range(1, len(values)):
+        prev, cur = values[i - 1], values[i]
+        if rise and prev < level <= cur:
+            return True
+        if (not rise) and prev > level >= cur:
+            return True
+    # 采样点太稀时退化为"电平附近确有样本"
+    return any(abs(v - level) <= band for v in values)
+
+
+def export_capture(inst: Scpi, args, ch: int, out_dir: str, prefix: str,
+                   level: float, state: str) -> None:
+    """画面已冻结，导出截图 + CSV/波形图（不再重新采集）。"""
+    if args.capture in ("shot", "both"):
+        cmd_shot(argparse.Namespace(out=out_dir, name=prefix + "_shot"), inst)
+    if args.capture in ("csv", "both"):
+        csv_args = argparse.Namespace(
+            channels=str(ch), out=out_dir, name=prefix,
+            mode="trigger", trig_source=f"CH{ch}",
+            trig_slope=args.trig_slope, trig_level=level, trig_mode="normal",
+            trig_wait=args.trig_wait, settle=max(0.6, args.settle), periods=0,
+            timebase=None, preset=None, ip=args.ip, port=args.port,
+            already_captured=True,
+            trig_info={"mode": "trigger", "trigger_source": f"CH{ch}",
+                       "trigger_slope": "rise" if args.trig_slope.startswith("r") else "fall",
+                       "trigger_mode": "normal", "trigger_level_v": level,
+                       "final_state": state, "timed_out": False},
+        )
+        cmd_csv(csv_args, inst)
+
+
+def run_trigger_mode(args, inst: Scpi, ch: int, out_dir: str) -> int:
+    """触发模式主流程（探头还没接、准备接的场景）：
+
+    先按触发电平武装（NORMal + RUN：不触发就不刷新），轮询测量值感知信号到达，
+    一到就 STOP 取记录、复核确实越过电平后落盘，然后重新武装等下一个人/下一次。
+    与"连续模式"互不影响，连续模式仍是 RUN + 测量轮询 + 变化即抓。
+    """
+    snap = snapshot_acq(inst)
+    ch_scale = inst.query_float(f"CHANnel{ch}:SCALe?")
+    ch_offset = inst.query_float(f"CHANnel{ch}:OFFSet?")
+    started = time.time()
+    events = 0
+    reason = "达到 --max-events 上限"
+
+    print("触发模式：先武装再等信号（NORMal，信号越过电平才刷新记录）")
+    inst.write("STOP")
+    time.sleep(0.2)
+    if args.timebase:                  # 探头没接时测不到频率，允许先固定时基
+        tb = apply_timebase(inst, parse_seconds(args.timebase))
+        print(f"  预置时基 {tb * 1e3:.4g} ms/div")
+    meas_setup(inst, ch)
+    level, basis = estimate_trigger_level(inst, ch, meas_read(inst), args)
+    slope_cn = "上升沿" if args.trig_slope.startswith("r") else "下降沿"
+    print(f"触发电平 {level:.4g} V（{basis}），{slope_cn}；"
+          f"信号越过该电平即抓拍（Vpp 判定门限 {args.min_vpp * 1e3:g} mV）")
+    print("-" * 96)
+
+    try:
+        while True:
+            if args.duration and time.time() - started >= args.duration:
+                reason = "到达 --duration"
+                break
+            if args.max_events and events >= args.max_events:
+                break
+
+            info = arm_trigger(inst, ch, args.trig_slope, level)
+            t_arm = time.time()
+            print(f"[{datetime.now():%H:%M:%S}] 已武装 CH{ch} {slope_cn} "
+                  f"{info['level_v']:.4g} V，等待信号…")
+
+            hit = False
+            while True:
+                if args.duration and time.time() - started >= args.duration:
+                    break
+                time.sleep(max(0.1, args.interval))
+                m = meas_read(inst)
+                if level_reachable(m, info["level_v"], args.min_vpp):
+                    hit = True
+                    break
+                if args.trig_wait and time.time() - t_arm >= args.trig_wait:
+                    break
+            if not hit:
+                if args.duration and time.time() - started >= args.duration:
+                    reason = "到达 --duration"
+                    break
+                print(f"      等待 {time.time() - t_arm:.1f}s 未见信号"
+                      f"（Vpp {fmt_meas(meas_read(inst).get('AMPLitude'), 'V')}），继续武装")
+                continue
+
+            inst.write("STOP")
+            time.sleep(0.35)
+            wave = None
+            try:
+                wave = read_channel(inst, ch)
+            except Exception as exc:               # noqa: BLE001
+                print(f"  警告: 读取记录失败（{exc}）")
+
+            if wave is None or not crossing_ok(wave["values"], info["level_v"],
+                                              args.trig_slope):
+                print("      记录未真正越过触发电平（可能只是测量值滞后），重新武装")
+                continue
+
+            events += 1
+            print(f"      触发命中：记录 Vpp "
+                  f"{(max(wave['values']) - min(wave['values'])):.4g} V，"
+                  f"{len(wave['values'])} 点 → 落盘")
+            prefix = datetime.now().strftime("watch_%H%M%S")
+            export_capture(inst, args, ch, out_dir, prefix, info["level_v"], "STOP")
+
+            # 抓完把显示调好（量程/时基），并按新信号重算电平再武装
+            if not args.no_autoscale:
+                fit_view(inst, args, None)
+                meas_setup(inst, ch)
+            level, basis = estimate_trigger_level(inst, ch, meas_read(inst), args)
+            print(f"      重新武装：电平 {level:.4g} V（{basis}）")
+            print("-" * 96)
+    except KeyboardInterrupt:
+        reason = "用户中断"
+    finally:
+        meas_clear(inst)
+        if not args.keep_view:
+            try:
+                inst.write(f"CHANnel{ch}:SCALe {ch_scale:.6g}")
+                inst.write(f"CHANnel{ch}:OFFSet {ch_offset:.6g}")
+            except Exception:
+                pass
+            restore_acq(inst, snap)
+        else:
+            try:
+                inst.write("RUNContinous")
+            except Exception:
+                pass
+
+    print(f"触发模式结束（{reason}）：共抓到 {events} 次，"
+          f"运行 {time.time() - started:.1f}s")
+    print(f"输出目录: {out_dir}")
+    return 0
+
+
+def cmd_watch(args, inst: Scpi) -> int:
+    ch = args.channel
+    state = inst.query(f"CHANnel{ch}:STATe?", DEFAULT_TIMEOUT).strip()
+    if state not in ("1", "ON"):
+        raise ScpiError(f"CH{ch} 未开启（CHANnel{ch}:STATe? = {state}），无法监测")
+
+    out_dir = ensure_dir(args.out)
+    return run_trigger_mode(args, inst, ch, out_dir)
 
 
 def cmd_analyze(args, inst: Scpi | None = None) -> int:
@@ -1081,6 +1440,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats = sub.add_parser("stats", help="统计波形（不落盘）")
     p_stats.add_argument("--channels", default="", help="通道列表，如 1,2")
 
+    p_watch = sub.add_parser(
+        "watch",
+        help="触发模式常驻等待：先武装好触发电平，信号一接上越过电平就自动抓拍落盘",
+        description="探头还没接、准备接时用：先设好触发电平并武装（NORMal + RUN，不触发不刷新记录），"
+                    "信号出现并越过电平后自动冻结、截图、导出 CSV 与波形图，然后重新武装继续等。"
+                    "探头已经接好的情况直接抓一次即可：用 csv / shot 子命令。",
+    )
+    p_watch.add_argument("--channel", type=int, default=1, help="监测通道，默认 1")
+    p_watch.add_argument("--out", help="输出目录，默认 ./scope_out")
+    p_watch.add_argument("--interval", type=float, default=1.0, help="轮询间隔秒数，默认 1.0")
+    p_watch.add_argument("--duration", type=float, default=0.0,
+                         help="监测总时长秒数，0=一直跑（Ctrl+C 结束），默认 0")
+    p_watch.add_argument("--settle", type=float, default=1.0,
+                         help="检测到变化后等待稳定秒数，默认 1.0")
+    p_watch.add_argument("--screen-periods", type=int, default=4,
+                         help="自动调时基后屏幕上显示几个信号周期，默认 4（0=不改时基）")
+    p_watch.add_argument("--timebase", default=None,
+                         help="固定时基（仅在测不到频率时使用），如 5ms")
+    p_watch.add_argument("--no-autoscale", action="store_true",
+                         help="不做 AUToscale，只按频率改时基")
+    p_watch.add_argument("--capture", choices=["shot", "csv", "both", "none"], default="both",
+                         help="事件触发后抓什么，默认 both（截图 + CSV/波形图）")
+    p_watch.add_argument("--trig-slope", choices=["rise", "fall"], default="rise",
+                         help="触发沿，默认 rise（上升沿）")
+    p_watch.add_argument("--trig-level", type=float, default=None,
+                         help="触发电平（V）；不给则按实测 MEAN + 10%%Vpp 自动设定并限幅在屏幕内")
+    p_watch.add_argument("--trig-wait", type=float, default=0.0,
+                         help="单次等待信号的最长秒数，默认 0=一直等（触发模式）")
+    p_watch.add_argument("--min-vpp", type=float, default=0.005,
+                         help="判定“真有波形”的最小 Vpp，默认 0.005 V（防止噪声误触发）")
+    p_watch.add_argument("--max-events", type=int, default=20,
+                         help="最多处理多少个事件后退出，0=不限，默认 20")
+    p_watch.add_argument("--keep-view", action="store_true",
+                         help="结束时保留调好的显示；默认恢复监测前的量程/时基/运行状态")
+
     p_an = sub.add_parser("analyze", help="离线分析已导出的 CSV：电平/频率/占空比/边沿时间")
     p_an.add_argument("file", help="csv 子命令产出的 CSV 路径")
     p_an.add_argument("--edge-pct", type=float, default=10.0,
@@ -1125,6 +1519,7 @@ def main(argv: list[str] | None = None) -> int:
         "shot": cmd_shot,
         "csv": cmd_csv,
         "stats": cmd_stats,
+        "watch": cmd_watch,
         "scpi": cmd_scpi,
     }
 

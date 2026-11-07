@@ -69,6 +69,24 @@
       "options": ["--channels <1,2>"]
     },
     {
+      "name": "watch",
+      "summary": "常驻等待（探头没接时用）：先武装触发电平，信号越过电平就冻结、截图、导出 CSV/波形图，再重新武装；探头已接好直接抓一次用 csv/shot",
+      "options": [
+        "--channel <n>",
+        "--trig-slope rise|fall",
+        "--trig-level <V>",
+        "--trig-wait <s>",
+        "--min-vpp <V>",
+        "--interval <s>",
+        "--duration <s>",
+        "--screen-periods <N>",
+        "--timebase <20us|1ms>",
+        "--capture shot|csv|both|none",
+        "--max-events <n>",
+        "--out <dir>"
+      ]
+    },
+    {
       "name": "analyze",
       "summary": "离线分析已导出的 CSV（电平/频率/占空比/边沿时间/抖动），不需要连仪器",
       "options": ["<csv>", "--edge-pct <10>"]
@@ -85,8 +103,9 @@
     }
   ],
   "run_modes": {
-    "continuous": "RUNContinous → 等待 --settle → STOP → 读取（默认）",
-    "trigger": "配置边沿触发 → RUNSingle → 等待 ACQuire:STATe? 为 COMP → 读取"
+    "continuous": "RUNContinous → 等待 --settle → STOP → 读取（csv 默认）",
+    "trigger": "配置边沿触发 → RUNSingle → 等待 ACQuire:STATe? 为 COMP → 读取",
+    "watch": "配置边沿触发 + NORMal + RUN（不触发不刷新）→ 测量轮询等到信号越过电平 → STOP → 校验记录真跨越 → 落盘 → 重新武装（探头没接时的常驻等待）"
   },
   "presets": {
     "freq": {"window_periods": 10, "purpose": "测频率/占空比", "measured_at_1khz": "1 ms/div, 305.176 kSa/s"},
@@ -112,6 +131,8 @@
     "ACQuire:POINts? 是存储深度，不是记录长度",
     "TRACe1:DATA? 是屏幕像素，不是波形",
     "RUNContinous/RUNSingle 不能带 ?，状态用 ACQuire:STATe? 读",
-    "TRIGger:A:FINDlevel 会把电平设为 0 V，应自行取信号中点"
+    "TRIGger:A:FINDlevel 会把电平设为 0 V，应自行取信号中点",
+    "RUNSingle 在电平不可达时会立刻 STOP（不等待），要预先武装等信号必须 TRIGger:A:MODE NORMal + RUN",
+    "查询超时后必须清空套接字缓冲（drain），否则后续查询整体错位（*IDN? 的字符串会被当浮点解析）"
   ]
 }

@@ -71,6 +71,7 @@ python scope.py --ip 169.254.101.84 scpi "CHANnel1:SCALe?"
 | `csv` | **采集波形 → 固定输出 CSV + 波形图 PNG（+ JSON）**；支持连续运行 / 触发单次两种模式、可限定 N 个周期 | `RUNContinous` / `RUNSingle` + `TRIGger:A:*` + `CHANnel<n>:DATA:HEADer?` + `CHANnel<n>:DATA?` | ✅ 两种模式均实拍验证 |
 | `stats` | 只算 min/max/Vpp/RMS/mean，不落盘 | 同上，本地统计 | ✅ |
 | `analyze` | 离线分析 CSV：低/高电平、Vpp、频率、占空比、上升/下降时间、周期抖动 | 纯本地计算，不需要连仪器 | ✅ 实测 1 kHz 方波：999.9879 Hz / 50.00 % |
+| `watch` | **常驻等待**（探头没接时用）：先武装触发电平，信号越过电平就自动冻结、截图、导出 CSV/波形图，再重新武装 | `TRIGger:A:MODE NORMal` + `RUN` 预武装 + `MEASurement<n>:RESult?` 轮询 + `STOP` | ✅ 实拍验证 |
 | `scpi` | 任意 SCPI 直通（`?` 结尾读响应） | 原始套接字 | ✅ |
 | `discover` | 扫网段找仪器并回读 `*IDN?` | TCP 5025 并发探测 | ✅ |
 
@@ -97,6 +98,39 @@ python scope.py --ip 169.254.101.84 scpi "CHANnel1:SCALe?"
 continuous → 时间窗 -5.498 ms ~ +4.499 ms（10 个周期，起点随机）
 trigger    → 时间窗 -5.000397 ms ~ +5.000394 ms（10 个周期，以触发点对称居中）
 ```
+
+## 常驻等待 `watch`（只有触发模式）
+
+按用途分工，**别用 `watch` 干一次性的活**：
+
+| 场景 | 用什么 | 行为 |
+|------|--------|------|
+| **探头还没接、准备接** | `watch` | `TRIGger:A:MODE NORMal` + `RUN`（不触发就不刷新记录）→ 轮询 `MEASurement` 判"信号到了" → `STOP` 读记录 → 复核真跨越电平 → 落盘 → 重新武装，一直等 |
+| **探头已经接好，直接抓当前波形** | `csv --mode continuous` / `shot` | 跑 `--settle` 秒后 `STOP` 冻结并读数据，**抓一次就结束**，没有轮询等待窗口 |
+
+示例（探头未接，接上就抓，电平 0.15 V 上升沿，抓 1 次就停）：
+
+```powershell
+python scripts/scope.py --ip 169.254.101.84 watch `
+    --trig-level 0.15 --trig-slope rise `
+    --interval 0.5 --max-events 1 --out .\scope_out
+```
+
+示例（探头已接好，直接抓一次）：
+
+```powershell
+python scripts/scope.py --ip 169.254.101.84 csv --mode continuous --periods 10 --out .\scope_out
+```
+
+要点：
+
+- 电平不给（`--trig-level`）时按当前测量值估：`MEAN + 10 %×Vpp`，并按屏幕范围限幅；
+  探头没接时 MEAN≈0、Vpp≈0 → 电平就是 **0 V**，接上任意信号都会立即触发。
+- `--min-vpp`（默认 5 mV）防噪声误触发；`--trig-wait 0`（默认）表示一直等。
+- 抓完会 `AUToscale` + 按频率重设时基再重新武装，所以**第一次抓的是接上瞬间当前时基下的画面**，
+  想要好看的时间窗就先给 `--timebase`（探头没接时测不到频率，只能手给）。
+- 落盘前会复核记录里**确实有越过触发电平的边沿**（`crossing_ok`），不复核就可能在"仪器没真触发"时存下一张废图。
+- 结束时默认恢复监测前的量程/偏移/运行状态（`--keep-view` 保持调好的显示）。
 
 ## 分辨率 / 时基控制（`--timebase` / `--preset`）
 
@@ -224,6 +258,16 @@ python scope.py --ip 169.254.101.84 csv --timebase 2e-5   # 等价写法
 
 16. **`ACQuire:MODE?`=`RTIM`、`ACQuire:TYPE?`=`REFR`** 是两个独立设置（实时采集 / 刷新模式），
     它们会影响实际采样率；本 skill **不擅自改动**这两项，只调时基与触发。
+
+17. **`RUNSingle` 不能用来"等触发"**。实测：`TRIGger:A:MODE NORMal` + 电平设到信号达不到的位置
+    （信号 Vpp 0.34 V、电平 3 V），`RUNSingle` 之后 `ACQuire:STATe?` **立刻就是 `STOP`**（连续轮询
+    2.4 s 全是 STOP），并不会停在"等待触发"。要"先武装、信号来了再抓"，只能
+    `TRIGger:A:MODE NORMal` + **`RUN`**（NORMal 模式下不触发就不刷新记录，信号一到立刻刷新）。
+
+18. **查询超时后必须清缓冲（drain）**。某条查询超时（例如 AUTOscale 刚做完、测量结果还没算出来时的
+    `MEASurement<n>:RESult?`），仪器往往仍会把响应晚一点发过来；不清理，后面的查询就整体错位 ——
+    典型症状是 `could not convert string to float: 'Rohde&Schwarz,...'`（`*IDN?` 的字符串被当成点数/档位解析）。
+    本 skill 的 `Scpi.drain()` 在测量查询失败处和 `csv` 入口各清一次。
 
 ## 与 U 盘方案的取舍
 
