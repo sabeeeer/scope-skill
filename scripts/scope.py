@@ -331,6 +331,8 @@ def cmd_shot(args, inst: Scpi) -> int:
 DIVISIONS = 12.0                       # RTB2000 水平 12 格
 TIME_LADDER = (200e-9, 500e-9, 1e-6, 2e-6, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6,
                200e-6, 500e-6, 1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 100e-3)
+SCALE_LADDER = (1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
+DEFAULT_TRIG_LEVEL_V = 1.0             # watch 默认触发电平：高于探头接上瞬间的扰动杂波
 
 
 def snapshot_acq(inst: Scpi) -> dict:
@@ -381,9 +383,20 @@ def restore_acq(inst: Scpi, snap: dict) -> None:
         pass
 
 
-def capture_continuous(inst: Scpi, settle: float) -> None:
-    """连续运行：跑一段时间后冻结，供读取。"""
+def capture_continuous(inst: Scpi, settle: float, verbose: bool = True) -> None:
+    """连续运行：跑一段时间后冻结，供读取。
+
+    连续模式不参与触发判定：先把触发方式设为 AUTO（无有效触发也按内部时基强制刷新），
+    否则仪器若停在 NORMal 且电平不可达，RUNContinous 也不会刷新记录，读到的还是旧数据。
+    """
+    inst.write("TRIGger:A:MODE AUTO")
     inst.write("RUNContinous")
+    if verbose:
+        try:
+            mode = inst.query("TRIGger:A:MODE?", DEFAULT_TIMEOUT).strip()
+        except Exception:
+            mode = "?"
+        print(f"连续运行 {max(0.2, settle):g}s（触发方式 {mode}，不配置触发电平）")
     time.sleep(max(0.2, settle))
     inst.write("STOP")
     time.sleep(0.35)
@@ -398,7 +411,7 @@ def capture_trigger(inst: Scpi, args) -> dict:
     if level is None:
         try:
             ch_digits = "".join(c for c in str(args.trig_source) if c.isdigit()) or "1"
-            capture_continuous(inst, min(max(args.settle, 0.4), 1.0))
+            capture_continuous(inst, min(max(args.settle, 0.4), 1.0), verbose=False)
             probe_wave = read_channel(inst, int(ch_digits))
             if probe_wave:
                 lo = percentile(probe_wave["values"], 0.05)
@@ -475,7 +488,7 @@ def survey_period(inst: Scpi, args, ch: int = 1) -> float:
     for tb in (1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 500e-6, 50e-3, 100e-3):
         inst.write(f"TIMebase:SCALe {tb:.6g}")
         inst.write("TIMebase:POSition 0")
-        capture_continuous(inst, args.settle)
+        capture_continuous(inst, args.settle, verbose=False)
         wave = read_channel(inst, ch)
         if wave is None:
             continue
@@ -679,6 +692,8 @@ def cmd_csv(args, inst: Scpi) -> int:
             else:
                 trig_info = capture_trigger(inst, args)
         else:
+            if args.trig_level is not None:
+                print("连续模式：不配置触发电平（探头已接好，仪器已有数据，不需要触发）")
             capture_continuous(inst, args.settle)
 
         waves = []
@@ -945,23 +960,37 @@ def fit_view(inst: Scpi, args, m: dict | None) -> dict:
     return info
 
 
-def estimate_trigger_level(inst: Scpi, ch: int, m: dict, args) -> tuple[float, str]:
-    """按实测值估触发电平：均值（PWM/方波正好落在高低电平中间）+ 一点 Vpp 偏置。"""
-    if args.trig_level is not None:
-        return float(args.trig_level), "手动指定"
-    mean = m.get("MEAN")
-    ampl = m.get("AMPLitude")
-    level = 0.0 if mean is None else mean
-    basis = "MEAN" if mean is not None else "0V"
-    if ampl and ampl > 0:
-        level += 0.10 * ampl
-        basis = f"MEAN+10%Vpp" if mean is not None else "10%Vpp"
+def pick_scale_value(volts_per_div: float) -> float:
+    """把需要的 V/div 对齐到 RTB2000 的 1-2-5 档位（不小于给定值）。"""
+    for s in SCALE_LADDER:
+        if s >= volts_per_div - 1e-12:
+            return s
+    return SCALE_LADDER[-1]
+
+
+def ensure_level_visible(inst: Scpi, ch: int, level: float) -> None:
+    """确保触发电平落在屏幕纵向范围内（否则信号越过电平也看不到波形）。"""
     scale = inst.query_float(f"CHANnel{ch}:SCALe?")
-    limit = 4.5 * scale                     # 屏幕纵向 10 格，中心 ±5 格，留半格余量
-    if abs(level) > limit:
-        level = limit if level > 0 else -limit
-        basis += "（超出屏幕，已限幅）"
-    return level, basis
+    offset = inst.query_float(f"CHANnel{ch}:OFFSet?")
+    if abs(level - offset) <= 4.0 * scale:          # 屏幕中心 ±5 格，留 1 格余量
+        return
+    need = pick_scale_value(abs(level - offset) / 4.0)
+    if need <= scale:
+        return
+    inst.write(f"CHANnel{ch}:SCALe {need:.6g}")
+    time.sleep(0.2)
+    print(f"  触发电平 {level:.4g} V 超出当前屏幕 → CH{ch} 改到 {need:.4g} V/div")
+
+
+def resolve_trigger_level(args) -> tuple[float, str]:
+    """触发电平：默认固定 1 V（高于探头接上瞬间的扰动杂波，不会被杂波误触发）。
+
+    显式给 `--trig-level` 就用给的值（信号本身幅度不到 1 V 时必须显式降低）。
+    不做"按实测 Vpp 自动估算"——探头没接时测量值就是噪声，估出来的电平会被杂波直接触发。
+    """
+    if args.trig_level is not None:
+        return float(args.trig_level), "指定值"
+    return DEFAULT_TRIG_LEVEL_V, "默认值，高于扰动杂波"
 
 
 def arm_trigger(inst: Scpi, ch: int, slope_word: str, level: float) -> dict:
@@ -1048,9 +1077,9 @@ def export_capture(inst: Scpi, args, ch: int, out_dir: str, prefix: str,
 def run_trigger_mode(args, inst: Scpi, ch: int, out_dir: str) -> int:
     """触发模式主流程（探头还没接、准备接的场景）：
 
-    先按触发电平武装（NORMal + RUN：不触发就不刷新），轮询测量值感知信号到达，
-    一到就 STOP 取记录、复核确实越过电平后落盘，然后重新武装等下一个人/下一次。
-    与"连续模式"互不影响，连续模式仍是 RUN + 测量轮询 + 变化即抓。
+    先按触发电平（默认 1 V，高于探头接上瞬间的扰动杂波）武装（NORMal + RUN：不触发就不刷新），
+    轮询测量值感知信号到达，一到就 STOP 取记录、复核确实越过电平后落盘，然后重新武装继续等。
+    探头已经接好的场景不走这里：直接用 csv --mode continuous 抓一次（连续模式不配置触发电平）。
     """
     snap = snapshot_acq(inst)
     ch_scale = inst.query_float(f"CHANnel{ch}:SCALe?")
@@ -1066,7 +1095,8 @@ def run_trigger_mode(args, inst: Scpi, ch: int, out_dir: str) -> int:
         tb = apply_timebase(inst, parse_seconds(args.timebase))
         print(f"  预置时基 {tb * 1e3:.4g} ms/div")
     meas_setup(inst, ch)
-    level, basis = estimate_trigger_level(inst, ch, meas_read(inst), args)
+    level, basis = resolve_trigger_level(args)
+    ensure_level_visible(inst, ch, level)
     slope_cn = "上升沿" if args.trig_slope.startswith("r") else "下降沿"
     print(f"触发电平 {level:.4g} V（{basis}），{slope_cn}；"
           f"信号越过该电平即抓拍（Vpp 判定门限 {args.min_vpp * 1e3:g} mV）")
@@ -1124,11 +1154,11 @@ def run_trigger_mode(args, inst: Scpi, ch: int, out_dir: str) -> int:
             prefix = datetime.now().strftime("watch_%H%M%S")
             export_capture(inst, args, ch, out_dir, prefix, info["level_v"], "STOP")
 
-            # 抓完把显示调好（量程/时基），并按新信号重算电平再武装
+            # 抓完把显示调好（量程/时基），再按同一个电平重新武装
             if not args.no_autoscale:
                 fit_view(inst, args, None)
                 meas_setup(inst, ch)
-            level, basis = estimate_trigger_level(inst, ch, meas_read(inst), args)
+            ensure_level_visible(inst, ch, level)
             print(f"      重新武装：电平 {level:.4g} V（{basis}）")
             print("-" * 96)
     except KeyboardInterrupt:
@@ -1419,14 +1449,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_csv.add_argument("--name", help="文件名前缀")
     p_csv.add_argument("--mode", choices=["continuous", "trigger"], default="continuous",
                        help="运行模式：continuous=连续运行（默认）；trigger=边沿触发单次采集")
-    p_csv.add_argument("--trig-source", default="CH1", help="触发源，默认 CH1")
+    p_csv.add_argument("--trig-source", default="CH1", help="触发源，默认 CH1（仅 --mode trigger）")
     p_csv.add_argument("--trig-slope", choices=["rise", "fall"], default="rise",
-                       help="触发沿：rise=上升沿（默认）/ fall=下降沿")
+                       help="触发沿：rise=上升沿（默认）/ fall=下降沿（仅 --mode trigger）")
     p_csv.add_argument("--trig-level", type=float, default=None,
-                       help="触发电平（V）；不给则先抓一帧，取信号 5%%/95%% 分位的中点")
+                       help="触发电平（V）；不给则取信号 5%%/95%% 分位的中点（仅 --mode trigger，"
+                            "连续模式不使用、不配置触发电平）")
     p_csv.add_argument("--trig-mode", choices=["auto", "normal"], default="auto",
-                       help="触发方式：auto=自动（默认）/ normal=标准（只认真实触发）")
-    p_csv.add_argument("--trig-wait", type=float, default=10.0, help="等待触发的超时秒数，默认 10")
+                       help="触发方式：auto=自动（默认）/ normal=标准（仅 --mode trigger）")
+    p_csv.add_argument("--trig-wait", type=float, default=10.0,
+                       help="等待触发的超时秒数，默认 10（仅 --mode trigger）")
     p_csv.add_argument("--settle", type=float, default=1.2, help="连续运行采集时长（秒），默认 1.2")
     p_csv.add_argument("--periods", type=int, default=0,
                        help="只截取 N 个完整周期（自动扫描时基提高采样率），0=不限制")
@@ -1465,7 +1497,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--trig-slope", choices=["rise", "fall"], default="rise",
                          help="触发沿，默认 rise（上升沿）")
     p_watch.add_argument("--trig-level", type=float, default=None,
-                         help="触发电平（V）；不给则按实测 MEAN + 10%%Vpp 自动设定并限幅在屏幕内")
+                         help="触发电平（V），不给就用默认 1.0 V —— 高于探头接上瞬间的扰动杂波，"
+                              "杂波不会触发；信号本身不到 1 V 时显式给小一点")
     p_watch.add_argument("--trig-wait", type=float, default=0.0,
                          help="单次等待信号的最长秒数，默认 0=一直等（触发模式）")
     p_watch.add_argument("--min-vpp", type=float, default=0.005,

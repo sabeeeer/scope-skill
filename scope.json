@@ -46,7 +46,7 @@
     },
     {
       "name": "csv",
-      "summary": "采集波形并固定输出 CSV + 波形图（+ JSON 元数据）",
+      "summary": "采集波形并固定输出 CSV + 波形图（+ JSON 元数据）；continuous 不配置触发电平（AUTO 自由刷新），trigger 才用电平",
       "options": [
         "--channels <1,2>",
         "--out <dir>",
@@ -70,11 +70,11 @@
     },
     {
       "name": "watch",
-      "summary": "常驻等待（探头没接时用）：先武装触发电平，信号越过电平就冻结、截图、导出 CSV/波形图，再重新武装；探头已接好直接抓一次用 csv/shot",
+      "summary": "常驻等待（探头没接时用）：触发电平默认 1 V（高于扰动杂波），信号越过电平就冻结、截图、导出 CSV/波形图，再重新武装；探头已接好直接抓一次用 csv/shot",
       "options": [
         "--channel <n>",
         "--trig-slope rise|fall",
-        "--trig-level <V>",
+        "--trig-level <V，默认 1.0>",
         "--trig-wait <s>",
         "--min-vpp <V>",
         "--interval <s>",
@@ -103,9 +103,9 @@
     }
   ],
   "run_modes": {
-    "continuous": "RUNContinous → 等待 --settle → STOP → 读取（csv 默认）",
+    "continuous": "TRIGger:A:MODE AUTO（连续模式不配置触发电平，靠 AUTO 强制刷新）→ RUNContinous → 等待 --settle → STOP → 读取（csv 默认）",
     "trigger": "配置边沿触发 → RUNSingle → 等待 ACQuire:STATe? 为 COMP → 读取",
-    "watch": "配置边沿触发 + NORMal + RUN（不触发不刷新）→ 测量轮询等到信号越过电平 → STOP → 校验记录真跨越 → 落盘 → 重新武装（探头没接时的常驻等待）"
+    "watch": "配置边沿触发（电平默认 1 V 抗扰动杂波）+ NORMal + RUN（不触发不刷新）→ 测量轮询等到信号越过电平 → STOP → 校验记录真跨越 → 落盘 → 重新武装（探头没接时的常驻等待）"
   },
   "presets": {
     "freq": {"window_periods": 10, "purpose": "测频率/占空比", "measured_at_1khz": "1 ms/div, 305.176 kSa/s"},
