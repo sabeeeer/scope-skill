@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 采集产物默认目录
+scope_out/
+shots/
+*.csv
+*.png
+!docs/**/*.png
+
+# 本地临时
+.venv/
+venv/
+Thumbs.db
+.DS_Store

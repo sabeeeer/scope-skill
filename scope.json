@@ -1,0 +1,117 @@
+{
+  "name": "scope",
+  "display_name": "示波器以太网控制（scope）",
+  "version": "1.0.0",
+  "description": "用网线（以太网 SCPI，TCP 5025）连接并控制 R&S RTB2000 系列示波器：抓屏幕截图、采集波形并固定输出 CSV + 波形图、离线分析频率/占空比/边沿时间、任意 SCPI 直通。",
+  "keywords": ["scope", "示波器", "oscilloscope", "SCPI", "RTB2000", "RTB2002", "RTB2004", "waveform", "csv", "screenshot"],
+  "entrypoints": {
+    "agent_skill": "SKILL.md",
+    "agents": "AGENTS.md",
+    "human": "README.md",
+    "reference": "references/scpi-rtb2000.md"
+  },
+  "entry": {
+    "type": "cli",
+    "language": "python",
+    "path": "scripts/scope.py",
+    "min_python": "3.9",
+    "invoke": "python scripts/scope.py [--ip <IP>] [--port <PORT>] <subcommand> [options]"
+  },
+  "requires": {
+    "python": ">=3.9",
+    "packages": [],
+    "optional_packages": ["matplotlib"],
+    "notes": "matplotlib 仅用于更美观的波形图；缺失时自动降级为内置纯标准库 PNG 渲染"
+  },
+  "transport": {
+    "protocol": "SCPI over raw TCP socket",
+    "default_port": 5025,
+    "env_ip": "SCOPE_IP",
+    "env_port": "SCOPE_PORT",
+    "ip_resolution_order": ["--ip", "SCOPE_IP", "discover"]
+  },
+  "supported_instruments": [
+    "Rohde&Schwarz RTB2000 series (RTB2002, RTB2004) — tested on RTB2004 fw 02.202"
+  ],
+  "commands": [
+    {
+      "name": "idn",
+      "summary": "读取仪器标识、存储深度、采样率、时基、各通道档位",
+      "options": []
+    },
+    {
+      "name": "shot",
+      "summary": "抓取屏幕截图 PNG",
+      "options": ["--out <dir>", "--name <prefix>"]
+    },
+    {
+      "name": "csv",
+      "summary": "采集波形并固定输出 CSV + 波形图（+ JSON 元数据）",
+      "options": [
+        "--channels <1,2>",
+        "--out <dir>",
+        "--name <prefix>",
+        "--mode continuous|trigger",
+        "--trig-source CH1",
+        "--trig-slope rise|fall",
+        "--trig-level <V>",
+        "--trig-mode auto|normal",
+        "--trig-wait <s>",
+        "--settle <s>",
+        "--periods <N>",
+        "--timebase <20us|100us|1ms|2e-5>",
+        "--preset <freq|detail|edge>"
+      ]
+    },
+    {
+      "name": "stats",
+      "summary": "统计波形（min/max/Vpp/RMS/mean），不落盘",
+      "options": ["--channels <1,2>"]
+    },
+    {
+      "name": "analyze",
+      "summary": "离线分析已导出的 CSV（电平/频率/占空比/边沿时间/抖动），不需要连仪器",
+      "options": ["<csv>", "--edge-pct <10>"]
+    },
+    {
+      "name": "scpi",
+      "summary": "任意 SCPI 命令直通（以 ? 结尾读取响应）",
+      "options": ["<command>"]
+    },
+    {
+      "name": "discover",
+      "summary": "扫描网段寻找示波器并回读 *IDN?",
+      "options": ["--cidr <CIDR>", "--full", "--threads <n>"]
+    }
+  ],
+  "run_modes": {
+    "continuous": "RUNContinous → 等待 --settle → STOP → 读取（默认）",
+    "trigger": "配置边沿触发 → RUNSingle → 等待 ACQuire:STATe? 为 COMP → 读取"
+  },
+  "presets": {
+    "freq": {"window_periods": 10, "purpose": "测频率/占空比", "measured_at_1khz": "1 ms/div, 305.176 kSa/s"},
+    "detail": {"window_periods": 1.5, "purpose": "看单周期细节", "measured_at_1khz": "200 µs/div, 1.000 MSa/s"},
+    "edge": {"window_periods": 0.05, "purpose": "测边沿，采样率最高", "measured_at_1khz": "5 µs/div, 41.667 MSa/s (24 ns/pt)"}
+  },
+  "outputs": {
+    "required": ["csv", "png"],
+    "optional": ["json"],
+    "naming": "scope_<YYYYMMDD_HHMMSS>.<ext>",
+    "csv_format": "首行表头 Time (s),CH1 (V);时间 %.9e,电压 %.6e;无注释行",
+    "png_content": "波形图:时间轴 ms、电压轴 V、网格、通道图例、标题含模式/点数/采样率/时基/触发电平/周期数"
+  },
+  "safety": {
+    "restores_instrument_state": true,
+    "restores": ["TIMebase:SCALe", "TIMebase:POSition", "TRIGger:A:MODE", "TRIGger:A:EDGE:SLOPe", "TRIGger:A:SOURce", "TRIGger:A:LEVel", "ACQuire:STATe"],
+    "read_waveform_requires_stop": true
+  },
+  "known_pitfalls": [
+    "读波形前必须 STOP，RUN 状态下 CHANnel<n>:DATA? 不返回",
+    "首次连 5025 常超时一次，需重试",
+    "CHANnel<n>:DATA? 单位是伏特，量化步长 = 档位/102.4",
+    "ACQuire:POINts? 是存储深度，不是记录长度",
+    "TRACe1:DATA? 是屏幕像素，不是波形",
+    "RUNContinous/RUNSingle 不能带 ?，状态用 ACQuire:STATe? 读",
+    "TRIGger:A:FINDlevel 会把电平设为 0 V，应自行取信号中点"
+  ]
+}
