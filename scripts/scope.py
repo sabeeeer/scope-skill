@@ -1429,7 +1429,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scope.py",
         description="R&S RTB2000 系列示波器以太网 SCPI 控制（零第三方依赖）",
-        epilog=f"仪器地址优先级: --ip > 环境变量 {ENV_IP} > discover 结果",
+        epilog=(
+            "两种模式（选错就白抓，先看探头接没接）:\n"
+            "  ① 触发模式（探头还没接，准备接）: watch 启动即触发模式，电平默认 1 V\n"
+            "     （高于探头接上瞬间的扰动杂波），信号越过电平才抓；或 csv --mode trigger 只抓一次。\n"
+            "  ② 连续模式（探头已经接好，示波器已有数据）: csv --mode continuous（默认）\n"
+            "     / shot，完全不配置触发电平，AUTO 自由刷新后冻结读数。\n"
+            "仪器地址优先级: --ip > 环境变量 "
+            f"{ENV_IP} > discover 结果"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--ip", help="仪器 IP，例如 169.254.101.84")
     parser.add_argument("--port", type=int, default=int(os.environ.get(ENV_PORT, DEFAULT_PORT)),

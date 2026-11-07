@@ -107,6 +107,19 @@
     "trigger": "配置边沿触发 → RUNSingle → 等待 ACQuire:STATe? 为 COMP → 读取",
     "watch": "配置边沿触发（电平默认 1 V 抗扰动杂波）+ NORMal + RUN（不触发不刷新）→ 测量轮询等到信号越过电平 → STOP → 校验记录真跨越 → 落盘 → 重新武装（探头没接时的常驻等待）"
   },
+  "two_modes": {
+    "rule": "动手前先问用户探头接了没有，并把两种模式的区别告诉用户",
+    "probe_not_connected": {
+      "mode": "触发模式",
+      "commands": ["watch", "csv --mode trigger"],
+      "trigger_level": "有；watch 默认固定 1 V（高于扰动杂波），csv --mode trigger 缺省取信号中点"
+    },
+    "probe_connected": {
+      "mode": "连续模式",
+      "commands": ["csv --mode continuous", "shot"],
+      "trigger_level": "没有；完全不配置触发电平，TRIGger:A:MODE AUTO 自由刷新"
+    }
+  },
   "presets": {
     "freq": {"window_periods": 10, "purpose": "测频率/占空比", "measured_at_1khz": "1 ms/div, 305.176 kSa/s"},
     "detail": {"window_periods": 1.5, "purpose": "看单周期细节", "measured_at_1khz": "200 µs/div, 1.000 MSa/s"},

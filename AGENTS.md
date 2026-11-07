@@ -11,6 +11,19 @@
 **触发词**：`scope`、`示波器`、示波器截图、示波器抓屏、导出示波器波形、波形导 CSV、
 网线连示波器、SCPI 控制示波器、RTB2004/RTB2002 连电脑。
 
+## ⚠️ 先看这里：两种模式（动手前必须先跟用户讲清楚）
+
+选错就白抓，判断依据只有一条：**探头接了没有**。
+
+| | **① 触发模式** | **② 连续模式** |
+|---|---|---|
+| 什么时候用 | **探头还没接、准备接**；要等信号出现那一刻的画面 | **探头已经接好**，屏幕上本来就有波形 |
+| 有没有触发电平 | **有**，默认 **1 V** —— 高于探头接上瞬间的扰动杂波，杂波不会误触发 | **没有**，完全不配置触发电平 |
+| 仪器怎么跑 | `TRIGger:A:MODE NORMal` + `RUN`（不触发就不刷新记录）→ 越过电平才冻结 | `TRIGger:A:MODE AUTO` + `RUNContinous` → `--settle` 秒 → `STOP` 读一次 |
+| 用哪个命令 | `watch`（**常驻等**，启动即触发模式）／`csv --mode trigger`（只抓一次） | `csv --mode continuous`（默认）／`shot` |
+
+**硬性要求**：用户只说"用 scope 抓一下"时，先问"探头接好了吗"，把两种模式的区别讲给他再动手。
+
 ## 前置条件
 
 1. Python 3.9+（无第三方依赖；`matplotlib` 可选，仅用于画更漂亮的波形图，缺失时自动降级）。
@@ -32,6 +45,7 @@ python scripts/scope.py --help
 | `idn` | 读仪器标识、存储深度、采样率、时基、各通道档位 |
 | `shot` | 抓屏幕截图 PNG |
 | `csv` | **采集波形 → 固定输出 CSV + 波形图 PNG（+ JSON 元数据）** |
+| `watch` | 常驻等待（**触发模式**）：探头没接时先武装 1 V 电平，信号越过就抓拍落盘并重新武装 |
 | `stats` | 只算 min/max/Vpp/RMS/mean，不落盘 |
 | `analyze <csv>` | 离线分析已导出的 CSV（电平/频率/占空比/边沿时间/抖动），不需要连仪器 |
 | `scpi "<CMD>"` | 任意 SCPI 直通（`?` 结尾读响应，否则写入） |
@@ -78,15 +92,16 @@ python scripts/scope.py analyze ./scope_out/scope_20261107_191500.csv
 | `scope_<时间戳>.png` | **是** | 波形图（时间 ms / 电压 V / 网格 / 图例 / 标题含模式与参数）|
 | `scope_<时间戳>.json` | 附加 | 元数据：IDN、模式、触发参数、采集设置、原始设置快照、通道统计 |
 
-## 两种运行模式
+## 两种运行模式（实现细节，区别见文首）
 
 | 模式 | 参数 | 仪器动作 |
 |------|------|----------|
-| 连续运行 | `--mode continuous`（默认） | `RUNContinous` → 等 `--settle` 秒 → `STOP` → 读取 |
+| 连续运行 | `--mode continuous`（默认） | `TRIGger:A:MODE AUTO`（**不设触发电平**）→ `RUNContinous` → 等 `--settle` 秒 → `STOP` → 读取 |
 | 触发单次 | `--mode trigger` | 配边沿触发 → `RUNSingle` → 等状态 `COMP` → 读取 |
+| 常驻等待 | `watch` | `NORMal` + `RUN` 预武装（电平默认 **1 V**）→ 轮询测量值 → 越过电平就冻结抓拍 → 重新武装 |
 
 触发参数：`--trig-source CH1`、`--trig-slope rise|fall`、`--trig-mode auto|normal`、
-`--trig-level <V>`（缺省自动取信号中点）、`--trig-wait <s>`。
+`--trig-level <V>`（`csv --mode trigger` 缺省自动取信号中点；`watch` 缺省固定 1 V）、`--trig-wait <s>`。
 
 ## 必须知道的坑
 
