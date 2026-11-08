@@ -6,6 +6,7 @@ __pycache__/
 # 采集产物默认目录
 scope_out/
 shots/
+_verify/
 *.csv
 *.png
 !docs/**/*.png
