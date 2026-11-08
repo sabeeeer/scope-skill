@@ -172,19 +172,10 @@ SYSTem:ERRor?   →  0,"No error"        # 队列空
 | `ACQuire:MODE?` | `RTIM`（实时采集）|
 | `ACQuire:TYPE?` | `REFR`（刷新 / 高分辨率模式）|
 
-## 10. 最简可用序列（复制即用）
+## 10. 连接和查询故障
 
-```python
-import socket
-s = socket.create_connection(("169.254.101.84", 5025), timeout=15)
-s.sendall(b"STOP\n");   s.recv(1024)          # 必须冻结
-s.sendall(b"CHANnel1:DATA:HEADer?\n")
-print(s.recv(4096))                            # -2.998927E-02,2.998600E-02,18304,1
-s.sendall(b"CHANnel1:DATA?\n")
-buf = b""
-while b"\n" not in buf:
-    buf += s.recv(262144)
-vals = [float(x) for x in buf.decode().strip().strip(",").split(",")]
-s.sendall(b"RUN\n")
-s.close()
-```
+- 用仪器 LAN 页面或 `python scripts/scope.py discover` 确认当前 IP。上面的 `169.254.101.84` 是一次实测地址，不是默认地址；Auto-IP/DHCP 可能改变它。
+- 电脑与仪器需网络可达。直连且仪器使用 `169.254.x.x/16` 时，电脑网卡也需要同一网段地址。先检查本机地址与网线，再检查 TCP 5025。
+- `STOP` 和 `RUNContinous` 是写命令，不会返回一行数据。不要在发送 `STOP` 后直接调用 `recv()`；仅对以 `?` 结尾的查询读取响应。波形读取和状态恢复应使用 `scripts/scope.py` 的已验证实现。
+- `CHANnel<n>:DATA?` 在运行状态可能不返回；先冻结，再读取。查询超时后清空迟到响应，再继续查询，避免后续结果错位。
+- `ACQuire:POINts?` 是配置的存储深度；当前记录点数以 `CHANnel<n>:DATA:HEADer?` 和实际返回值为准。

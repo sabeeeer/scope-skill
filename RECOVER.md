@@ -7,7 +7,7 @@
 ```bash
 git clone https://github.com/sabeeeer/scope-skill.git
 cd scope-skill
-python scripts/scope.py --help          # 能看到 7 个子命令就说明可用
+python scripts/scope.py --help          # 能看到 8 个子命令就说明可用
 ```
 
 把 `scope/` 目录放进 AI 工具的技能目录即可（CodeBuddy/Claude: `~/.codebuddy/skills/scope`；
@@ -17,7 +17,7 @@ python scripts/scope.py --help          # 能看到 7 个子命令就说明可�
 
 | 项 | 要求 | 缺失后果 |
 |----|------|----------|
-| Python | **3.9+** | 无法运行 |
+| Python | **3.10+** | 无法运行 |
 | 第三方包 | **无**（`matplotlib` 可选） | 没装 matplotlib 时波形图自动降级为内置渲染（无文字标注），CSV/JSON 不受影响 |
 | 网络 | 与示波器同二层网络（直连或同一交换机） | 连不上仪器 |
 | 仪器 | R&S RTB2000 系列（RTB2002 / RTB2004），固件 02.202 实测 | 其他型号命令不同，需自写适配层 |

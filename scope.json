@@ -1,7 +1,7 @@
 {
   "name": "scope",
   "display_name": "示波器以太网控制（scope）",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "用网线（以太网 SCPI，TCP 5025）连接并控制 R&S RTB2000 系列示波器：抓屏幕截图、采集波形并固定输出 CSV + 波形图、离线分析频率/占空比/边沿时间、任意 SCPI 直通。",
   "keywords": ["scope", "示波器", "oscilloscope", "SCPI", "RTB2000", "RTB2002", "RTB2004", "waveform", "csv", "screenshot"],
   "entrypoints": {
@@ -14,11 +14,11 @@
     "type": "cli",
     "language": "python",
     "path": "scripts/scope.py",
-    "min_python": "3.9",
+    "min_python": "3.10",
     "invoke": "python scripts/scope.py [--ip <IP>] [--port <PORT>] <subcommand> [options]"
   },
   "requires": {
-    "python": ">=3.9",
+    "python": ">=3.10",
     "packages": [],
     "optional_packages": ["matplotlib"],
     "notes": "matplotlib 仅用于更美观的波形图；缺失时自动降级为内置纯标准库 PNG 渲染"
@@ -60,7 +60,11 @@
         "--settle <s>",
         "--periods <N>",
         "--timebase <20us|100us|1ms|2e-5>",
-        "--preset <freq|detail|edge>"
+        "--preset <freq|detail|edge>",
+        "--observe <s>",
+        "--observe-interval <s>",
+        "--screen-periods <n>",
+        "--stable-periods <n>"
       ]
     },
     {

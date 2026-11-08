@@ -33,7 +33,7 @@
 python scripts/scope.py --help
 ```
 
-要求 Python 3.9+。任何平台（Windows / Linux / macOS）均可，脚本无硬编码路径。
+要求 Python **3.10+**。任何平台（Windows / Linux / macOS）均可，脚本无硬编码路径。
 
 ## 快速开始
 
@@ -62,6 +62,9 @@ python scripts/scope.py --ip 169.254.101.84 csv --timebase 20us
 # 6c. 或用用途预设：freq / detail / edge
 python scripts/scope.py --ip 169.254.101.84 csv --preset edge
 
+# 6d. 探头还没接好、等信号出现：先武装触发，再常驻等待
+python scripts/scope.py --ip 169.254.101.84 watch --channel 1 --trig-slope rise --trig-level 1
+
 # 7. 离线分析（不连仪器）
 python scripts/scope.py analyze ./scope_out/scope_20261107_191500.csv
 ```
@@ -78,8 +81,12 @@ python scripts/scope.py analyze ./scope_out/scope_20261107_191500.csv
 
 ## 运行模式
 
-- `--mode continuous`（默认）：连续运行，跑 `--settle` 秒后冻结读取。适合看整体波形、测频率/占空比。
-- `--mode trigger`：配置边沿触发后单次采集，数据以触发点对齐。适合相位比较、抖动统计、周期对比。
+- `--mode continuous`（默认）：`AUTO + RUN`，跑 `--settle` 秒取一帧，另按 `--observe`（默认 6 秒）
+  做跨秒数值观察并输出 `_trend.csv`。适合探头已接好、信号持续输出的场景。
+- `--mode trigger`：配置边沿触发后单次采集，数据以触发点对齐；调稳并稳定 10 个周期后才导出。
+  适合已接好探头、要抓指定边沿。
+- `watch`（常驻等待）：探头还没接好时用。先武装 `NORMal + RUN`，信号出现并越过触发电平后
+  自动调刻度、确认稳定，然后导出 CSV/PNG 并继续等下一次。探头已接好则直接用 `csv`。
 
 触发参数：`--trig-source`、`--trig-slope rise|fall`、`--trig-mode auto|normal`、
 `--trig-level`（缺省自动取信号中点）、`--trig-wait`。
@@ -122,6 +129,8 @@ scope/
 ├── scope.json                   # 机器可读清单（名称/关键词/入口/子命令）
 ├── scripts/
 │   └── scope.py                 # 唯一执行入口
+├── tests/
+│   └── test_scope.py            # 单元测试（16 项，不用真实仪器）
 └── references/
     └── scpi-rtb2000.md          # SCPI 命令实测参考（含错误码与不存在的命令）
 ```
@@ -137,6 +146,7 @@ scope/
 ## 安全
 
 - 脚本只做 SCPI 读写，不安装任何东西、不修改系统设置。
-- 采集结束后会还原时基、触发设置与原来的运行状态（`RUN` / `STOP` / `BRE`）。
+- 触发模式与 `watch` 结束后会还原时基、触发设置与原来的运行状态；
+  **连续模式按设计保留调好的刻度与 `AUTO + RUN`**（下次直接可用）。
 - 不要在他人正在测量的仪器上随意执行 `--mode trigger` 之外的破坏性命令；`scpi` 子命令是直通，
   写入命令会直接改变仪器状态，使用前确认。
