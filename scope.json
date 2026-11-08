@@ -64,7 +64,12 @@
         "--observe <s>",
         "--observe-interval <s>",
         "--screen-periods <n>",
-        "--stable-periods <n>"
+        "--stable-periods <n>",
+        "--period-tol <0.02>",
+        "--min-spp <10>",
+        "--fill-min <0.35>",
+        "--fill-max <0.95>",
+        "--cooldown <0.45>"
       ]
     },
     {
@@ -123,6 +128,14 @@
       "commands": ["csv --mode continuous", "shot"],
       "trigger_level": "没有；完全不配置触发电平，TRIGger:A:MODE AUTO 自由刷新"
     }
+  },
+  "quality_gates": {
+    "samples_per_period_min": 10,
+    "fill_ratio_range": [0.35, 0.95],
+    "period_jitter_max": 0.02,
+    "freq_consistency_max_change": 0.2,
+    "stable_periods_min": 10,
+    "note": "全部为数值判据；任一不满足则不写 CSV/PNG 并说明原因。填充率下限取 0.35 是因为 1-2-5 档位量化后填充率只能落在约 40%~95%。"
   },
   "presets": {
     "freq": {"window_periods": 10, "purpose": "测频率/占空比", "measured_at_1khz": "1 ms/div, 305.176 kSa/s"},

@@ -23,6 +23,7 @@ import concurrent.futures as futures
 import csv
 import ipaddress
 import json
+import math
 import os
 import sys
 import time
@@ -46,13 +47,17 @@ _ensure_windows_socket_environment()
 import socket
 
 try:  # Windows 控制台默认 GBK，强制 UTF-8 避免 UnicodeEncodeError
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # line_buffering：输出被重定向/管道时默认是全缓冲，进程结束前一行都不打印，
+    # 看起来就像"卡死"。改成按行刷新，进度能实时看到。
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 except Exception:
     pass
 
 DEFAULT_PORT = 5025
-DEFAULT_TIMEOUT = 15.0
+DEFAULT_TIMEOUT = 8.0             # 单条查询超时：宁可快速失败并报清楚，也不要让人以为死机
+                                  # （20 s 的默认值会让"仪器无响应"看起来像脚本卡死）
+COOL_AFTER_STOP = 0.45            # 每次 STOP 后的冷却时间：高频 RUN/STOP 会把仪器的 SCPI 服务打崩（实测掉线两次）
 DATA_TIMEOUT = 90.0
 ENV_IP = "SCOPE_IP"
 ENV_PORT = "SCOPE_PORT"
@@ -207,7 +212,7 @@ class Frozen:
             self.original = "RUN"
         if self.original not in ("STOP", "BRE"):
             self.inst.write("STOP")
-            time.sleep(0.6)
+            time.sleep(COOL_AFTER_STOP)
         return self
 
     def __exit__(self, *exc) -> None:
@@ -226,8 +231,20 @@ class Frozen:
 # 波形读取
 # --------------------------------------------------------------------------- #
 def read_channel(inst: Scpi, ch: int) -> dict | None:
-    """读取当前冻结的波形；读操作不得重新运行采集或替换记录。"""
+    """读取当前冻结的波形；读操作不得重新运行采集或替换记录。
+
+    先查记录点数：仪器处于 STOP/BRE 且还没采到数据时点是 0，
+    此时发 `CHANnel<n>:DATA?` 会一直等不到响应（实测空等到 90 s 超时），
+    所以必须先判 0 并立刻返回 None，让调用方去调时基重采。
+    """
     if inst.query(f"CHANnel{ch}:STATe?", DEFAULT_TIMEOUT).strip() not in ("1", "ON"):
+        return None
+
+    try:
+        points = int(float(inst.query(f"CHANnel{ch}:DATA:POINts?", DEFAULT_TIMEOUT)))
+    except Exception:                      # noqa: BLE001  老固件可能不支持，退化为直接读
+        points = -1
+    if points == 0:
         return None
 
     header = inst.query(f"CHANnel{ch}:DATA:HEADer?", DEFAULT_TIMEOUT)
@@ -346,11 +363,21 @@ def cmd_shot(args, inst: Scpi) -> int:
 # --------------------------------------------------------------------------- #
 # 运行模式：连续运行 / 触发（单次）
 # --------------------------------------------------------------------------- #
-DIVISIONS = 12.0                       # RTB2000 水平 12 格
-VERT_DIVISIONS = 8.0                   # RTB2000 垂直 8 格
+# 屏幕格数：RTB2000 是水平 12 格 / 垂直 8 格；其他机型不同，可用环境变量覆盖
+DIVISIONS = float(os.environ.get("SCOPE_HDIV", "12"))
+VERT_DIVISIONS = float(os.environ.get("SCOPE_VDIV", "8"))
 TIME_LADDER = (200e-9, 500e-9, 1e-6, 2e-6, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6,
-               200e-6, 500e-6, 1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 100e-3)
-SCALE_LADDER = (1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
+               200e-6, 500e-6, 1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 100e-3,
+               200e-3, 500e-3, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0,
+               200.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 25000.0,
+               50000.0, 100000.0)
+MAX_TIMEBASE = 1e5                     # 时基搜索上限（s/div）：按"大量程仪器"留足余量，
+                                       # 不同机型真实上限由仪器自己拒绝并回读校正
+MIN_TIMEBASE = 1e-12                   # 时基搜索下限（s/div）：同样留余量给高带宽机型
+# 垂直档位（V/div）：从 µV/div 级一路到 kV/div 级，覆盖小信号与大电压探头
+SCALE_LADDER = (1e-6, 2e-6, 5e-6, 1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4,
+                1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 0.1, 0.2, 0.5,
+                1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
 DEFAULT_TRIG_LEVEL_V = 1.0             # watch 默认触发电平：高于探头接上瞬间的扰动杂波
 
 
@@ -444,6 +471,150 @@ def restore_acq(inst: Scpi, snap: dict, preserve_continuous_display: bool = Fals
         raise ScpiError(f"还原示波器设置失败: {'; '.join(errors)}")
 
 
+def nudge_timebase(inst: Scpi, attempt: int = 1, origin: float | None = None) -> float | None:
+    """记录为空时的双向盲调：以"起点时基"为基准，先连变快 3 次，再连变慢 3 次。
+
+    为什么要以 origin 为基准而不是当前值：以当前值做 ±10 会来回打转，
+    永远出不来（实测 0.1↔1 s/div 死循环）。以起点为基准、单向前进，
+    就能保证 6 步覆盖 origin 的 10^-3 ~ 10^3 倍，两个极端都能逃出来。
+    """
+    try:
+        tb = float(inst.query("TIMebase:SCALe?", DEFAULT_TIMEOUT))
+    except Exception:                      # noqa: BLE001
+        return None
+    base = origin if origin and origin > 0 else tb
+    if attempt <= 3:
+        nxt = base / (10.0 ** attempt)     # 先往"更快"方向找（空记录最常见的原因）
+    else:
+        nxt = base * (10.0 ** (attempt - 3))   # 再往"更慢"方向找（慢信号场景）
+    nxt = max(MIN_TIMEBASE, min(MAX_TIMEBASE, nxt))
+    if abs(nxt - tb) < 1e-15:
+        return None
+    inst.write(f"TIMebase:SCALe {nxt:g}")
+    inst.write("TIMebase:POSition 0")
+    return nxt
+
+
+def converge_display(inst: Scpi, ch: int, args, level: float | None,
+                     capture_fn, label: str = "", max_rounds: int = 12) -> dict | None:
+    """先读波形数据 → 粗调 → 验证 → 细调 → 验证，多步收敛（连续/触发通用）。
+
+    每一步都重新采集并读回数值来判断上一步是否有效，判据全部是数值：
+    是否顶到上/下轨、记录里能否数出 >=2 个周期、Vpp 占几格。不使用任何图片。
+    """
+    fine_done = False
+    prev_freq: float | None = None
+    wave = None
+    nudge_origin: float | None = None
+    nudge_count = 0
+    for attempt in range(1, max_rounds + 1):
+        try:
+            wave = capture_fn()
+        except Exception as exc:              # noqa: BLE001
+            print(f"  {label}第 {attempt} 轮采集失败：{exc}")
+            return None
+        if wave is None:
+            # 记录为空（仪器停在 STOP、或时基太慢进入滚动采集）：先用测量位取频率
+            # （RUN 下可读、不打断采集），能取到就直接算时基，省掉反复 RUN/STOP。
+            freq_now = measure_frequency(inst, ch)
+            if freq_now:
+                sp = max(int(getattr(args, "screen_periods", 10) or 0),
+                         int(getattr(args, "stable_periods", 10) or 0) + 2)
+                tb = pick_timebase(1.0 / freq_now, sp)
+                inst.write(f"TIMebase:SCALe {tb:.6g}")
+                inst.write("TIMebase:POSition 0")
+                print(f"  {label}第 {attempt} 轮：记录为空，但测量框读到 {freq_now:.6g} Hz"
+                      f" → 直接设时基 {tb * 1e6:.4g} µs/div")
+                continue
+            if nudge_origin is None:
+                try:
+                    nudge_origin = float(inst.query("TIMebase:SCALe?", DEFAULT_TIMEOUT))
+                except Exception:             # noqa: BLE001
+                    nudge_origin = None
+            nudge_count += 1
+            nxt = nudge_timebase(inst, nudge_count, nudge_origin)
+            print(f"  {label}第 {attempt} 轮：记录为空（仪器可能处于 STOP/滚动采集）"
+                  f"→ 盲调时基到 {nxt:.4g} s/div 后重试" if nxt else
+                  f"  {label}第 {attempt} 轮：记录为空，且无法读取当前时基")
+            continue
+
+        lvl = level if level is not None else (wave["min_v"] + wave["max_v"]) / 2.0
+
+        # 超慢时基（>1 s/div）下采样率极低，记录会"看起来像"一个缓慢的假波形
+        # （实测：1 kHz 方波在 500 s/div 被读成 0.004 Hz、68 V）。这种记录一律不采信，
+        # 先往更快的方向调，直到进入可信范围再判周期。
+        try:
+            tb_now = float(inst.query("TIMebase:SCALe?", DEFAULT_TIMEOUT))
+        except Exception:                     # noqa: BLE001
+            tb_now = 0.0
+        if tb_now > 1.0:
+            if nudge_origin is None:
+                nudge_origin = tb_now
+            nudge_count += 1
+            nxt = nudge_timebase(inst, nudge_count, nudge_origin)
+            print(f"  {label}第 {attempt} 轮：时基 {tb_now:g} s/div 过慢，记录不可信"
+                  f"（采样率过低/滚动采集）→ 先调到 {nxt:.4g} s/div" if nxt else
+                  f"  {label}第 {attempt} 轮：时基 {tb_now:g} s/div 过慢且无法调整")
+            continue
+
+        hit_hi, hit_lo = detect_clipping(wave)
+        freq = estimate_frequency(wave["values"], wave["dt_s"], lvl)
+        need_coarse = hit_hi or hit_lo or freq is None
+
+        if need_coarse:
+            reason = ("上下轨触顶" if (hit_hi and hit_lo)
+                      else "单侧触顶" if (hit_hi or hit_lo) else "数不出 2 个周期")
+            print(f"  {label}第 {attempt} 轮：{reason} → 粗调")
+            tune_from_record(inst, ch, wave, lvl, args)
+            fine_done = False
+            continue
+
+        # 跨轮频率一致性：采样率过低时会出现混叠（例如真实 1 kHz 被测成 667 Hz），
+        # 频率跳变超过 20% 说明上一轮视图不可信，按"未收敛"继续调。
+        if freq and prev_freq and abs(freq - prev_freq) / max(freq, prev_freq) > 0.2:
+            print(f"  {label}第 {attempt} 轮：频率 {prev_freq:.6g} → {freq:.6g} Hz"
+                  f"（变化 {abs(freq - prev_freq) / max(freq, prev_freq) * 100:.0f}%，疑混叠）"
+                  f"→ 视为未收敛，继续调")
+            prev_freq = freq
+            tune_from_record(inst, ch, wave, lvl, args)
+            fine_done = False
+            continue
+        if freq:
+            prev_freq = freq
+
+        if not fine_done:
+            print(f"  {label}第 {attempt} 轮：可测（{freq:.6g} Hz，Vpp {wave['vpp_v']:.4g} V）→ 细调")
+            tune_from_record(inst, ch, wave, lvl, args)
+            fine_done = True
+            continue
+
+        sig = waveform_signature(wave, lvl, getattr(args, "trig_slope", "rise"))
+        problems = validate_signal_quality(sig, args)
+        jm = sig.get("jitter_max")
+        spp = sig.get("samples_per_period")
+        fill = sig.get("fill_ratio")
+        extra = ""
+        if spp is not None:
+            extra += f"，每周期 {spp:.0f} 点"
+        if fill is not None:
+            extra += f"，填充 {fill * 100:.0f}%"
+        if jm is not None:
+            extra += f"，周期内偏差 {jm * 100:.2f}%（{sig.get('periods_n', 0)} 个周期）"
+
+        if problems:
+            print(f"  {label}第 {attempt} 轮：未通过有效性判据（{'；'.join(problems)}）→ 继续调")
+            tune_from_record(inst, ch, wave, lvl, args)
+            fine_done = False
+            continue
+
+        print(f"  {label}第 {attempt} 轮：验证通过（{freq:.6g} Hz，Vpp {wave['vpp_v']:.4g} V，"
+              f"{wave['scale_v_per_div']:.4g} V/div{extra}）")
+        return wave
+
+    print(f"  {label}达到最大轮数 {max_rounds}，按当前记录继续")
+    return wave
+
+
 def capture_continuous(inst: Scpi, settle: float, verbose: bool = True) -> None:
     """连续运行：跑一段时间后冻结，供读取。
 
@@ -461,7 +632,7 @@ def capture_continuous(inst: Scpi, settle: float, verbose: bool = True) -> None:
         print(f"连续运行 {max(0.2, settle):g}s（触发方式 {mode}；稳定性检查全程 AUTO）")
     time.sleep(max(0.2, settle))
     inst.write("STOP")
-    time.sleep(0.35)
+    time.sleep(COOL_AFTER_STOP)
 
 
 def observe_continuous(inst: Scpi, ch: int, seconds: float, interval: float) -> tuple[list[dict], dict | None]:
@@ -511,7 +682,7 @@ def observation_events(rows: list[dict]) -> list[dict]:
     return events
 
 
-def capture_trigger(inst: Scpi, args) -> dict:
+def capture_trigger(inst: Scpi, args, verbose: bool = True) -> dict:
     """触发模式：配置边沿触发 → RUNSingle → 等采集完成。"""
     slope = "POS" if args.trig_slope.lower().startswith("r") else "NEG"
     tmode = "AUTO" if args.trig_mode.lower().startswith("a") else "NORMal"
@@ -528,7 +699,8 @@ def capture_trigger(inst: Scpi, args) -> dict:
     inst.write(f"TRIGger:A:MODE {tmode}")
     if level is not None:
         inst.write(f"TRIGger:A:LEVel {level:g}")
-        print(f"触发电平: {level:.4f} V（命令行或面板电平；无 AUTO 预采集）")
+        if verbose:
+            print(f"触发电平: {level:.4f} V（命令行或面板电平；无 AUTO 预采集）")
     else:
         raise ScpiError("无法从波形估算触发电平，请指定 --trig-level")
     time.sleep(0.3)
@@ -569,8 +741,9 @@ def capture_trigger(inst: Scpi, args) -> dict:
     if wave is None or actual_level is None or not crossing_ok(
             wave["values"], actual_level, info["trigger_slope"]):
         raise ScpiError(f"触发状态 {state}，但记录未跨越 {actual_level} V，未导出")
-    print(f"触发完成: 状态 {state}，电平 {actual_level} V，"
-          f"{info['trigger_slope']} 沿，{info['trigger_mode']} 模式")
+    if verbose:
+        print(f"触发完成: 状态 {state}，电平 {actual_level} V，"
+              f"{info['trigger_slope']} 沿，{info['trigger_mode']} 模式")
     return info
 
 
@@ -762,6 +935,17 @@ def cmd_csv(args, inst: Scpi) -> int:
     out_dir = ensure_dir(args.out)
     channels = [int(c) for c in args.channels.split(",") if c.strip()] if args.channels else [1, 2, 3, 4]
 
+    # 运行模式必须对用户明示：连续与触发的采集语义不同，选错会拿到不可比的数据
+    explicit = getattr(args, "mode", None)
+    if explicit is None:
+        args.mode = "continuous"
+        print("运行模式：连续运行（未指定 --mode，取默认值）")
+        print("          如需按触发沿对齐的单次采集，请加 --mode trigger")
+    else:
+        label = ("触发单次（等触发后按边沿对齐采集）" if args.mode == "trigger"
+                 else "连续运行（自由采集，不依赖触发）")
+        print(f"运行模式：{label}  [--mode {args.mode}]")
+
     meta = inst_meta(inst)
     captured_at = datetime.now().astimezone().isoformat(timespec="seconds")
     snap = snapshot_acq(inst, channels)
@@ -807,8 +991,23 @@ def cmd_csv(args, inst: Scpi) -> int:
                 probe = read_channel(inst, trigger_ch)
                 if probe is None:
                     raise ScpiError(f"CH{trigger_ch} 没有可用波形，未导出")
-                level = trig_info["trigger_level_v"]
-                tune_from_record(inst, trigger_ch, probe, level, args)
+                level = trig_info.get("trigger_level_v")
+
+                def _capture_trig() -> dict | None:
+                    capture_trigger(inst, args, verbose=False)   # 每轮都重新武装单次触发
+                    try:
+                        return read_channel(inst, trigger_ch)
+                    except Exception:                # noqa: BLE001
+                        return None
+
+                tuned = converge_display(inst, trigger_ch, args, level, _capture_trig,
+                                         label="触发模式 ")
+                if tuned is not None:
+                    probe = tuned
+                    if level is None:
+                        level = (probe["min_v"] + probe["max_v"]) / 2.0
+                if level is None:
+                    level = (probe["min_v"] + probe["max_v"]) / 2.0
                 if stabilize_waveform(inst, trigger_ch, level, args.trig_slope, args) is None:
                     raise ScpiError("触发波形未稳定保持指定周期数，未写出 CSV/PNG")
         else:
@@ -825,10 +1024,38 @@ def cmd_csv(args, inst: Scpi) -> int:
                     active_ch = ch
                     break
             if probe is None or active_ch is None:
-                raise ScpiError("指定通道无可用波形，未写出 CSV/PNG")
-            mid = (probe["min_v"] + probe["max_v"]) / 2.0
-            level = mid if args.trig_level is None else args.trig_level
-            tune_from_record(inst, active_ch, probe, level, args)
+                # 记录可能为空（仪器停在 STOP / 时基太慢进入滚动采集）：
+                # 不直接报错，交给收敛流程靠盲调时基救回来。
+                for ch in channels:
+                    try:
+                        if inst.query(f"CHANnel{ch}:STATe?", DEFAULT_TIMEOUT).strip() in ("1", "ON"):
+                            active_ch = ch
+                            break
+                    except Exception:         # noqa: BLE001
+                        continue
+                if active_ch is None:
+                    active_ch = channels[0]
+                print(f"  当前没有可用记录（仪器可能停在 STOP），进入自动调整：CH{active_ch}")
+            if args.trig_level is not None:
+                level = args.trig_level
+            elif probe is not None:
+                level = (probe["min_v"] + probe["max_v"]) / 2.0
+            else:
+                level = None
+
+            def _capture_cont() -> dict | None:
+                capture_continuous(inst, max(0.4, args.settle), verbose=False)
+                try:
+                    return read_channel(inst, active_ch)
+                except Exception:             # noqa: BLE001
+                    return None
+
+            tuned = converge_display(inst, active_ch, args, level, _capture_cont,
+                                     label="连续模式 ")
+            if tuned is not None:
+                probe = tuned
+                level = ((probe["min_v"] + probe["max_v"]) / 2.0
+                         if args.trig_level is None else args.trig_level)
             observation, latest = observe_continuous(
                 inst, active_ch, args.observe, args.observe_interval)
             events = observation_events(observation)
@@ -1121,15 +1348,49 @@ def seek_timebase_for_period(inst: Scpi, ch: int, args, tries: int = 8) -> float
     测到频率后再由调用方精调时基。全程只用数值判断。
     """
     settle = max(0.4, min(1.5, float(getattr(args, "settle", 1.2) or 1.2)))
-    for _ in range(tries):
-        try:
-            tb = float(inst.query("TIMebase:SCALe?", DEFAULT_TIMEOUT))
-        except Exception:
-            return None
-        nxt = tb * 10.0
-        if nxt > 50.0:
-            print("    时基已达上限（50 s/div），停止自动寻找")
-            return None
+
+    # 先用测量位取频率（RUN 状态下可读，不打断采集），拿到就不必逐个时基试
+    fast = measure_frequency(inst, ch)
+    if fast:
+        print(f"    测量框读到 {fast:.6g} Hz（未打断采集），直接算时基")
+        return fast
+
+    try:
+        current = float(inst.query("TIMebase:SCALe?", DEFAULT_TIMEOUT))
+    except Exception:
+        return None
+
+    # 双向搜索：时基太快会"看不到 1 个周期"，太慢会"记录为空/采样率过低"，
+    # 所以同时准备"变慢 ×10"和"变快 ÷10"两类候选，并按**离当前值的倍数由近到远**排序
+    # （倍数取 ≥1 的那个），这样通常 1~3 次就能命中，而不是按 ×10/÷10 交替乱序试。
+    # 候选顺序：① 常用时基优先（绝大多数信号落在 1 ms~100 ms，从极端起点能一步到位）
+    # ② 再按"离当前值的倍数"双向铺开，覆盖快/慢两侧
+    preferred = (1e-3, 1e-2, 1e-4, 1e-1, 1e-5, 1.0, 1e-6, 10.0, 1e-7, 100.0,
+                 1e-8, 1e-9, 1e-10, 1e-11, 1e3, 2500.0)
+    exp: list[float] = []
+    for k in range(1, 9):
+        exp.append(current / (10 ** k))             # 变快
+        exp.append(current * (10 ** k))             # 变慢
+    # 对数距离排序：|log10(候选/当前)| 越小越先试，快慢两个方向对称看待
+    exp = sorted((c for c in exp if MIN_TIMEBASE <= c <= MAX_TIMEBASE),
+                 key=lambda c: abs(math.log10(c / current)))
+    raw: list[float] = [c for c in preferred if MIN_TIMEBASE <= c <= MAX_TIMEBASE] + exp
+    seen: set[float] = set()
+    candidates: list[float] = []
+    for c in raw:
+        key = round(c, 18)
+        if key in seen or not (MIN_TIMEBASE <= c <= MAX_TIMEBASE):
+            continue
+        if abs(c - current) / max(current, c) < 1e-9:   # 跳过与当前相同的值
+            continue
+        seen.add(key)
+        candidates.append(c)
+    candidates = candidates[:max(tries, 10)]
+    if candidates:
+        print("    候选时基（由近到远）：" +
+              "、".join(f"{c:.4g}" for c in candidates))
+
+    for nxt in candidates:
         inst.write(f"TIMebase:SCALe {nxt:g}")
         inst.write("TIMebase:POSition 0")
         capture_continuous(inst, settle, verbose=False)
@@ -1138,47 +1399,101 @@ def seek_timebase_for_period(inst: Scpi, ch: int, args, tries: int = 8) -> float
         except Exception:
             wave = None
         if not wave or not wave.get("points"):
-            print(f"    时基 {nxt:g} s/div：记录为空，继续放宽")
+            print(f"    时基 {nxt:g} s/div：记录为空，换下一个")
             continue
         level = (percentile(wave["values"], 0.05) + percentile(wave["values"], 0.95)) / 2.0
         freq = estimate_frequency(wave["values"], wave["dt_s"], level)
         if freq:
             print(f"    时基 {nxt:g} s/div：测到 {freq:.6g} Hz（{wave['points']} 点）")
             return freq
-        print(f"    时基 {nxt:g} s/div：仍不足 2 个周期，继续放宽")
+        print(f"    时基 {nxt:g} s/div：数不出 2 个周期，换下一个")
     return None
 
 
-def tune_from_record(inst: Scpi, ch: int, wave: dict, level: float, args) -> None:
-    """用已读取的记录调量程和时基；下一次采集再验证调整效果。"""
+def detect_clipping(wave: dict) -> tuple[bool, bool]:
+    """判断记录是否顶到上/下轨。
+
+    触顶时记录里的 max/min 只是"可见范围"，Vpp 不是真实幅值，不能再用 vpp/6 估档位。
+    返回 (顶到上轨, 顶到下轨)。
+    """
+    half = VERT_DIVISIONS / 2.0 * wave["scale_v_per_div"]
+    hi_rail = wave["offset_v"] + half
+    lo_rail = wave["offset_v"] - half
+    tol = 0.02 * (2.0 * half) if half else 0.0
+    return (wave["max_v"] >= hi_rail - tol, wave["min_v"] <= lo_rail + tol)
+
+
+def seek_vertical_scale(inst: Scpi, ch: int, wave: dict) -> float:
+    """按"是否触顶"决定垂直档位的调整幅度（与时基寻找同一套思路）。
+
+    - 上下轨都顶到（硬削波）：真实幅值未知 → 按 **10 倍**粗调，一步到位
+    - 只顶到一侧（软削波）：按 **4 倍**粗调，避免过冲太多
+    - 未触顶：按 vpp/6 精调（此时 vpp 可信）
+    """
+    old_scale = wave["scale_v_per_div"]
+    hit_hi, hit_lo = detect_clipping(wave)
+    if hit_hi and hit_lo:
+        return pick_scale_value(old_scale * 10.0)
+    if hit_hi or hit_lo:
+        return pick_scale_value(old_scale * 4.0)
+
+    vpp = wave["vpp_v"]
+    full = VERT_DIVISIONS * old_scale
+    half = full / 2.0
+    # 几乎平线：可能信号在屏幕外（均值贴边 → 往大档位找），也可能信号本身很小（往小档位找）
+    if vpp < 0.02 * full:
+        near_rail = abs(wave["mean_v"] - wave["offset_v"]) >= 0.6 * half
+        return (pick_scale_value(old_scale * 10.0) if near_rail
+                else pick_scale_value(old_scale / 10.0))
+
+    return pick_scale_value(max(vpp / 6.0, SCALE_LADDER[0]))
+
+
+def tune_from_record(inst: Scpi, ch: int, wave: dict, level: float, args) -> bool:
+    """用已读取的记录调量程和时基；下一次采集再验证调整效果。
+
+    返回值 `coarse=True` 表示本次是"触顶粗调"（档位一次跳很多倍），调用方必须再采集一轮
+    用新记录精调并复核，不能拿粗调后的记录直接判稳定导出。
+    """
+    coarse = False
     if not getattr(args, "no_autoscale", False):
-        scale = pick_scale_value(max(wave["vpp_v"] / 6.0, 1e-3))
         old_scale = wave["scale_v_per_div"]
-        old_offset = wave["offset_v"]
-        half = VERT_DIVISIONS / 2.0 * old_scale
-        clipped = (wave["max_v"] >= old_offset + half - 0.05 * old_scale
-                   or wave["min_v"] <= old_offset - half + 0.05 * old_scale)
-        if clipped:
-            scale = pick_scale_value(max(scale, old_scale * 2.0))
+        hit_hi, hit_lo = detect_clipping(wave)
+        scale = seek_vertical_scale(inst, ch, wave)
+        coarse = hit_hi or hit_lo
         inst.write(f"CHANnel{ch}:SCALe {scale:.6g}")
         inst.write(f"CHANnel{ch}:OFFSet {wave['mean_v']:.6g}")
-        print(f"  按记录调量程：CH{ch} {scale:.6g} V/div，偏移 {wave['mean_v']:.6g} V")
+        if hit_hi and hit_lo:
+            why = "上下轨都触顶→10 倍粗调"
+        elif hit_hi or hit_lo:
+            why = "单侧触顶→4 倍粗调"
+        else:
+            why = "未触顶→按 vpp/6 精调"
+        print(f"  按记录调量程：CH{ch} {scale:.6g} V/div，偏移 {wave['mean_v']:.6g} V"
+              f"（{why}，旧 {old_scale:.6g} V/div）")
+
+    # 触顶时记录是失真的，频率/周期都不可信：先只把幅值调回去，
+    # 等下一轮用未削顶的新记录再判断时基，避免拿坏数据去试时基（白耗 RUN/STOP）。
+    if coarse:
+        return coarse
 
     if any(getattr(args, key, None) for key in ("timebase", "preset", "periods")):
-        return
+        return coarse
     freq = estimate_frequency(wave["values"], wave["dt_s"], level)
     if freq is None:
         print("  当前记录不足两个周期，按 10 倍步进放宽时基寻找波形…")
         freq = seek_timebase_for_period(inst, ch, args)
+        coarse = True
     if freq is None:
         print("  仍未找到可测周期的视图，保留原时基")
-        return
+        return coarse
     screen_periods = max(int(getattr(args, "screen_periods", 10) or 0),
                          int(getattr(args, "stable_periods", 10) or 0) + 2)
     tb = pick_timebase(1.0 / freq, screen_periods)
     inst.write(f"TIMebase:SCALe {tb:.6g}")
     inst.write("TIMebase:POSition 0")
     print(f"  按记录调时基：{tb * 1e6:.6g} µs/div，约覆盖 {screen_periods} 周期")
+    return coarse
 
 
 def autoscale_by_record(inst: Scpi, ch: int, args) -> dict | None:
@@ -1214,7 +1529,7 @@ def autoscale_by_record(inst: Scpi, ch: int, args) -> dict | None:
               f"（约 {args.screen_periods} 个周期）")
     time.sleep(0.4)
     inst.write("STOP")
-    time.sleep(0.3)
+    time.sleep(COOL_AFTER_STOP)
 
     wave = None
     for _ in range(2):
@@ -1238,7 +1553,7 @@ def autoscale_by_record(inst: Scpi, ch: int, args) -> dict | None:
         inst.write("RUN")
         time.sleep(0.4)
         inst.write("STOP")
-        time.sleep(0.3)
+        time.sleep(COOL_AFTER_STOP)
     return wave
 
 
@@ -1410,24 +1725,86 @@ def crossing_ok(values: list[float], level: float, slope_word: str) -> bool:
 
 
 def waveform_signature(wave: dict, level: float, slope: str) -> dict:
-    """从记录数值提取稳定指纹：均值、幅度、频率、相位和边沿数。"""
+    """从记录数值提取稳定指纹：均值、幅度、频率、相位、边沿数、周期内误差。"""
     values = wave["values"]
     dt = wave["dt_s"]
     edges = [i * dt for i in range(1, len(values))
              if values[i - 1] < level <= values[i]]
+
+    # 周期内误差：逐个周期间隔与平均周期的相对偏差。
+    # 十来个周期里若明显参差（例如脉宽抖动、间歇丢沿），单看平均值会漏判，
+    # 所以这里同时给出平均偏差和最大单周期偏差，供稳定判据使用。
+    periods = [edges[i + 1] - edges[i] for i in range(len(edges) - 1)]
+    jitter = jitter_max = None
+    if len(periods) >= 2:
+        mean_period = sum(periods) / len(periods)
+        if mean_period > 0:
+            devs = [abs(p - mean_period) / mean_period for p in periods]
+            jitter = sum(devs) / len(devs)
+            jitter_max = max(devs)
+
+    freq = estimate_frequency(values, dt, level)
+    # 每周期采样点数 = fs / f（也是判断是否混叠的直接依据：工程实践要求 ≥5，测边沿要 ≥10）
+    samples_per_period = ((1.0 / freq) / dt) if (freq and dt) else None
+    # 垂直填充率：Vpp 占满几屏（<50% 量化误差偏大，>90% 有削顶风险）
+    scale = wave.get("scale_v_per_div") or 0.0
+    fill_ratio = (wave["vpp_v"] / (VERT_DIVISIONS * scale)) if scale else None
+
     return {
         "vpp": wave["vpp_v"],
         "mean": wave["mean_v"],
-        "freq": estimate_frequency(values, dt, level),
+        "freq": freq,
         "phase": (wave["t_start_s"] + edges[0]) if edges else None,
         "n_edges": len(edges),
         "cross": crossing_ok(values, level, slope),
+        "periods_n": len(periods),
+        "jitter": jitter,
+        "jitter_max": jitter_max,
+        "samples_per_period": samples_per_period,
+        "fill_ratio": fill_ratio,
     }
 
 
+def validate_signal_quality(sig: dict, args=None) -> list[str]:
+    """单次采集有效性判据（不属于仪器校准，只判"这条记录能不能用来报数"）。
+
+    依据工程实践与采样定理：
+      * 每周期采样点数 ≥10（测边沿/脉宽的最低要求，也是混叠的直接判据）
+      * 垂直填充率 50%~90%（太低量化误差大，太高有削顶风险）
+      * 记录内完整周期数 ≥ (设定的稳定周期数 - 2)
+    返回未通过项的文字说明；空列表表示全部通过。
+    """
+    min_spp = float(getattr(args, "min_spp", 10.0) or 10.0)
+    fill_min = float(getattr(args, "fill_min", 0.35) or 0.35)
+    fill_max = float(getattr(args, "fill_max", 0.95) or 0.95)
+    # 单条记录只需够算频率/抖动（3~5 个周期）；"保持 10 个周期"由持续时间维度保证，
+    # 不能拿它要求单条记录，否则短记录会被误判。
+    min_periods = max(3, min(5, int(getattr(args, "stable_periods", 10) or 10) - 2))
+
+    problems: list[str] = []
+    spp = sig.get("samples_per_period")
+    if spp is not None and spp < min_spp:
+        problems.append(f"每周期仅 {spp:.1f} 点（<{min_spp:g}，存在混叠风险）")
+    fill = sig.get("fill_ratio")
+    if fill is not None:
+        if fill < fill_min:
+            problems.append(f"垂直填充 {fill * 100:.0f}%（<{fill_min * 100:.0f}%，量化误差偏大）")
+        elif fill > fill_max:
+            problems.append(f"垂直填充 {fill * 100:.0f}%（>{fill_max * 100:.0f}%，有削顶风险）")
+    pn = int(sig.get("periods_n") or 0)
+    if pn < min_periods:
+        problems.append(f"记录内仅 {pn} 个完整周期（<{min_periods}）")
+    return problems
+
+
 def signature_is_stable(a: dict, b: dict | None, tol: float = 0.05,
-                        require_phase: bool = True) -> bool:
-    """两条记录的幅度、频率及可选触发相位是否一致。"""
+                       require_phase: bool = True,
+                       period_tol: float = 0.02) -> bool:
+    """两条记录的幅度、频率、周期内误差及可选触发相位是否一致。
+
+    `period_tol` 是"十个周期内误差"的判据：任何一条记录里，单个周期相对平均
+    周期的最大偏差都必须 ≤ period_tol，否则视为还没调稳（值可能是混叠或抖动）。
+    """
     if b is None:
         return False
     if not (a["cross"] and b["cross"] and a["freq"] and b["freq"]):
@@ -1440,6 +1817,10 @@ def signature_is_stable(a: dict, b: dict | None, tol: float = 0.05,
         return False
     if abs(a["mean"] - b["mean"]) > max(0.02, tol * max(a["vpp"], b["vpp"])):
         return False
+    for rec in (a, b):
+        jm = rec.get("jitter_max")
+        if jm is not None and jm > period_tol:
+            return False
     if not require_phase:
         return True
     if a["phase"] is None or b["phase"] is None:
@@ -1492,7 +1873,7 @@ def stabilize_waveform(inst: Scpi, ch: int, level: float, slope: str, args,
             inst.write("RUN")
         time.sleep(wait)
         inst.write("STOP")
-        time.sleep(0.25)
+        time.sleep(COOL_AFTER_STOP)
         try:
             wave = read_channel(inst, ch)
         except Exception as exc:           # noqa: BLE001
@@ -1512,7 +1893,14 @@ def stabilize_waveform(inst: Scpi, ch: int, level: float, slope: str, args,
         if not (sig["cross"] and sig["freq"] and sig["n_edges"] >= 2):
             prev, streak, stable_since = None, 0, None
             continue
-        if signature_is_stable(sig, prev, require_phase=acquisition_mode != "continuous"):
+        quality = validate_signal_quality(sig, args)
+        if quality:
+            if streak == 0:
+                print(f"  记录未通过有效性判据：{'；'.join(quality)}")
+            prev, streak, stable_since = None, 0, None
+            continue
+        if signature_is_stable(sig, prev, require_phase=acquisition_mode != "continuous",
+                               period_tol=float(getattr(args, "period_tol", 0.02) or 0.02)):
             streak += 1
         else:
             streak, stable_since = 1, time.monotonic()
@@ -1520,8 +1908,11 @@ def stabilize_waveform(inst: Scpi, ch: int, level: float, slope: str, args,
         need = periods / sig["freq"]
         held = time.monotonic() - stable_since
         if streak >= 3 and held >= need:
+            jm = sig.get("jitter_max")
+            extra = (f"，周期内最大偏差 {jm * 100:.2f}%（{sig.get('periods_n', 0)} 个周期）"
+                     if jm is not None else "")
             print(f"  波形稳定：连续 {streak} 条记录数值一致，保持 "
-                  f"{held * 1e3:.4g} ms ≥ {periods} 个周期 → 允许导出")
+                  f"{held * 1e3:.4g} ms ≥ {periods} 个周期{extra} → 允许导出")
             return wave
     print(f"  警告: {max_rounds} 轮内未稳定保持 {periods} 个周期，"
           f"跳过本次记录（不写 CSV/PNG）")
@@ -1564,6 +1955,21 @@ def meas_read_one(inst: Scpi, slot: int) -> float | None:
     if abs(value) >= MEAS_INVALID:
         return None
     return value
+
+
+def measure_frequency(inst: Scpi, ch: int) -> float | None:
+    """用测量位 2 取频率：RUN 状态下即可读，**不需要 STOP**。
+
+    为什么重要：读波形必须 STOP，而"逐级试时基"的做法会让仪器前面板的
+    RUN/STOP 反复跳。测量位在 RUN 下就能给出频率，先拿到频率再一次性算时基，
+    可以把 STOP 次数压到最少。
+    """
+    try:
+        meas_setup(inst, ch)
+        freq = meas_read_one(inst, 2)
+    except Exception:                      # noqa: BLE001
+        return None
+    return freq if (freq and freq > 0) else None
 
 
 def monitor_for_signal(inst: Scpi, ch: int, level: float, args,
@@ -1624,34 +2030,73 @@ def capture_on_trigger(inst: Scpi, ch: int, level: float, args,
     used = info["level_v"]
     time.sleep(max(0.5, args.settle))        # NORMal 不触发不刷新，给触发一点时间落定
     inst.write("STOP")
-    time.sleep(0.35)
+    time.sleep(COOL_AFTER_STOP)
     wave = None
     try:
         wave = read_channel(inst, ch)
     except Exception as exc:                 # noqa: BLE001
         print(f"  警告: 读取记录失败（{exc}）")
-    if wave is None or not crossing_ok(wave["values"], used, args.trig_slope):
+
+    def _capture_any() -> dict | None:
+        """采集一条记录用于"把显示调对"，不要求越过电平。
+
+        这里必须用 **AUTO + RUNContinous**：NORMal 在没有触发事件时不会刷新记录，
+        读回来永远是空的（实测会一直空转）。
+        """
+        inst.write("TRIGger:A:TYPe EDGE")
+        inst.write(f"TRIGger:A:SOURce CH{ch}")
+        inst.write(f"TRIGger:A:EDGE:SLOPe {info['slope_cmd']}")
+        inst.write("TRIGger:A:MODE AUTO")
+        inst.write(f"TRIGger:A:LEVel {used:.6g}")
+        inst.write("RUNContinous")
+        time.sleep(max(0.4, args.settle))
+        inst.write("STOP")
+        time.sleep(COOL_AFTER_STOP)
+        try:
+            return read_channel(inst, ch)
+        except Exception:                    # noqa: BLE001
+            return None
+
+    crossed = wave is not None and crossing_ok(wave["values"], used, args.trig_slope)
+    if not crossed and wave is not None:
+        hit_hi, hit_lo = detect_clipping(wave)
+        no_freq = estimate_frequency(wave["values"], wave["dt_s"], used) is None
+        if hit_hi or hit_lo or no_freq:
+            print("      记录不可信（触顶或数不出周期）→ 先按数值把显示调好再判")
+            fixed = converge_display(inst, ch, args, used, _capture_any,
+                                     label="触发等待 ")
+            if fixed is not None:
+                wave = fixed
+                crossed = crossing_ok(wave["values"], used, args.trig_slope)
+
+    if not crossed:
         print("      记录里没有越过该电平的边沿（信号还没到），回到监视")
         return False, None, used
 
-    tune_from_record(inst, ch, wave, used, args)
-    # 调量程/时基后重新武装，读取调节后的记录并复核边沿。
-    inst.write("TRIGger:A:TYPe EDGE")
-    inst.write(f"TRIGger:A:SOURce CH{ch}")
-    inst.write(f"TRIGger:A:EDGE:SLOPe {info['slope_cmd']}")
-    inst.write("TRIGger:A:MODE NORMal")
-    inst.write(f"TRIGger:A:LEVel {used:.6g}")
-    inst.write("RUN")
-    time.sleep(max(0.4, args.settle))
-    inst.write("STOP")
-    time.sleep(0.35)
-    again = None
-    try:
-        again = read_channel(inst, ch)
-    except Exception:                        # noqa: BLE001
-        pass
-    if again is not None and crossing_ok(again["values"], used, args.trig_slope):
-        wave = again
+    # 多步收敛：粗调 → 验证 → 细调 → 验证，与 csv 的两种模式共用同一套逻辑
+    slope_cmd = info["slope_cmd"]
+
+    def _capture() -> dict | None:
+        inst.write("TRIGger:A:TYPe EDGE")
+        inst.write(f"TRIGger:A:SOURce CH{ch}")
+        inst.write(f"TRIGger:A:EDGE:SLOPe {slope_cmd}")
+        inst.write("TRIGger:A:MODE NORMal")
+        inst.write(f"TRIGger:A:LEVel {used:.6g}")
+        inst.write("RUN")
+        time.sleep(max(0.4, args.settle))
+        inst.write("STOP")
+        time.sleep(COOL_AFTER_STOP)
+        try:
+            got = read_channel(inst, ch)
+        except Exception:                    # noqa: BLE001
+            return None
+        if got is None or not crossing_ok(got["values"], used, args.trig_slope):
+            return None
+        return got
+
+    tuned = converge_display(inst, ch, args, used, _capture, label="触发等待 ")
+    if tuned is not None:
+        wave = tuned
     scale = inst.query_float(f"CHANnel{ch}:SCALe?")
     tb = inst.query_float("TIMebase:SCALe?")
     print(f"      CH{ch} {scale:.4g} V/div，时基 {tb * 1e6:.4g} µs/div，记录已冻结")
@@ -2014,6 +2459,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=int(os.environ.get(ENV_PORT, DEFAULT_PORT)),
                         help=f"SCPI 端口，默认 {DEFAULT_PORT}")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="连接超时秒数")
+    parser.add_argument("--query-timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help=f"单条 SCPI 查询超时秒数，默认 {DEFAULT_TIMEOUT}；"
+                             f"极慢时基下仪器应答变慢可调大（调大后无响应时等待更久）")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("idn", help="读取仪器标识与通道设置")
@@ -2026,8 +2474,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_csv.add_argument("--channels", default="", help="通道列表，如 1,2；默认全部开启的通道")
     p_csv.add_argument("--out", help="输出目录，默认 ./scope_out")
     p_csv.add_argument("--name", help="文件名前缀")
-    p_csv.add_argument("--mode", choices=["continuous", "trigger"], default="continuous",
-                       help="运行模式：continuous=连续运行（默认）；trigger=抓边沿、调稳后导出一次")
+    p_csv.add_argument("--mode", choices=["continuous", "trigger"], default=None,
+                       help="运行模式：continuous=连续运行；trigger=抓边沿、调稳后导出一次。"
+                            "不写按 continuous 处理，且会在输出里明确提示（建议先与用户确认用哪种）")
     p_csv.add_argument("--trig-source", default="CH1", help="触发源，默认 CH1（仅 --mode trigger）")
     p_csv.add_argument("--trig-slope", choices=["rise", "fall"], default="rise",
                        help="触发及稳定性检查的边沿：rise=上升沿（默认）/ fall=下降沿")
@@ -2039,14 +2488,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_csv.add_argument("--trig-wait", type=float, default=10.0,
                        help="等待触发的超时秒数，默认 10（仅 --mode trigger）")
     p_csv.add_argument("--settle", type=float, default=1.2, help="连续运行采集时长（秒），默认 1.2")
+    p_csv.add_argument("--cooldown", type=float, default=COOL_AFTER_STOP,
+                       help=f"每次 STOP 后的冷却秒数，默认 {COOL_AFTER_STOP}；"
+                            f"高频 RUN/STOP 会把仪器 SCPI 服务打崩，不建议调到 0.2 以下")
     p_csv.add_argument("--observe", type=float, default=6.0,
                        help="连续模式数值观察时长（秒），默认 6；0=跳过长期观察")
-    p_csv.add_argument("--observe-interval", type=float, default=0.5,
-                       help="连续观察每次数值记录的采集时长（秒），默认 0.5")
+    p_csv.add_argument("--observe-interval", type=float, default=1.0,
+                       help="连续观察每次数值记录的采集时长（秒），默认 1.0"
+                            "（调小会增加 RUN/STOP 次数，仪器更容易掉线）")
     p_csv.add_argument("--screen-periods", type=int, default=10,
                        help="自动调时基后屏幕显示几个信号周期，默认 10")
     p_csv.add_argument("--stable-periods", type=at_least_ten_periods, default=10,
                        help="波形稳定保持几个周期才写 CSV/PNG，至少 10（默认 10）")
+    p_csv.add_argument("--period-tol", type=float, default=0.02,
+                       help="周期内误差容限：单个周期相对平均周期的最大偏差，默认 0.02（2%%）")
+    p_csv.add_argument("--min-spp", type=float, default=10.0,
+                       help="每周期最少采样点数，默认 10（低于此值有混叠风险，判为不可用）")
+    p_csv.add_argument("--fill-min", type=float, default=0.35,
+                       help="垂直填充率下限，默认 0.35（1-2-5 档位量化下填充率只能落在约 40%%~95%%）")
+    p_csv.add_argument("--fill-max", type=float, default=0.95,
+                       help="垂直填充率上限，默认 0.95（超过视为有削顶风险）")
     p_csv.add_argument("--periods", type=int, default=0,
                        help="只截取 N 个完整周期（自动扫描时基提高采样率），0=不限制")
     p_csv.add_argument("--timebase", default=None,
@@ -2073,10 +2534,14 @@ def build_parser() -> argparse.ArgumentParser:
                          help="监测总时长秒数，0=一直跑（Ctrl+C 结束），默认 0")
     p_watch.add_argument("--settle", type=float, default=1.0,
                          help="检测到变化后等待稳定秒数，默认 1.0")
+    p_watch.add_argument("--cooldown", type=float, default=COOL_AFTER_STOP,
+                         help=f"每次 STOP 后的冷却秒数，默认 {COOL_AFTER_STOP}")
     p_watch.add_argument("--screen-periods", type=int, default=10,
                          help="自动调时基后屏幕上显示几个信号周期，默认 10（0=不改时基）")
     p_watch.add_argument("--stable-periods", type=at_least_ten_periods, default=10,
                          help="波形连续稳定保持几个周期才写 CSV/PNG，至少 10（默认 10）")
+    p_watch.add_argument("--period-tol", type=float, default=0.02,
+                         help="周期内误差容限：单个周期相对平均周期的最大偏差，默认 0.02（2%%）")
     p_watch.add_argument("--timebase", default=None,
                          help="固定时基（仅在测不到频率时使用），如 5ms")
     p_watch.add_argument("--no-autoscale", action="store_true",
@@ -2114,6 +2579,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    global COOL_AFTER_STOP, DEFAULT_TIMEOUT
+    if getattr(args, "cooldown", None):
+        COOL_AFTER_STOP = max(0.0, float(args.cooldown))
+    if getattr(args, "query_timeout", None):
+        DEFAULT_TIMEOUT = max(1.0, float(args.query_timeout))
 
     if args.cmd == "discover":
         try:
