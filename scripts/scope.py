@@ -1113,6 +1113,42 @@ def estimate_frequency(values: list[float], dt: float, level: float) -> float | 
     return (len(edges) - 1) / span
 
 
+def seek_timebase_for_period(inst: Scpi, ch: int, args, tries: int = 8) -> float | None:
+    """记录里看不到 2 个周期时，按 10 倍步进放宽时基，直到能估出频率。
+
+    触发场景：时基过快（如 1 ns/div，窗口只有十几 ns）或过慢（记录 0 点，进入滚动采集）时，
+    直接读记录既估不出频率也判不了稳定性。此时必须先把视图放宽到"至少 2 个周期"，
+    测到频率后再由调用方精调时基。全程只用数值判断。
+    """
+    settle = max(0.4, min(1.5, float(getattr(args, "settle", 1.2) or 1.2)))
+    for _ in range(tries):
+        try:
+            tb = float(inst.query("TIMebase:SCALe?", DEFAULT_TIMEOUT))
+        except Exception:
+            return None
+        nxt = tb * 10.0
+        if nxt > 50.0:
+            print("    时基已达上限（50 s/div），停止自动寻找")
+            return None
+        inst.write(f"TIMebase:SCALe {nxt:g}")
+        inst.write("TIMebase:POSition 0")
+        capture_continuous(inst, settle, verbose=False)
+        try:
+            wave = read_channel(inst, ch)
+        except Exception:
+            wave = None
+        if not wave or not wave.get("points"):
+            print(f"    时基 {nxt:g} s/div：记录为空，继续放宽")
+            continue
+        level = (percentile(wave["values"], 0.05) + percentile(wave["values"], 0.95)) / 2.0
+        freq = estimate_frequency(wave["values"], wave["dt_s"], level)
+        if freq:
+            print(f"    时基 {nxt:g} s/div：测到 {freq:.6g} Hz（{wave['points']} 点）")
+            return freq
+        print(f"    时基 {nxt:g} s/div：仍不足 2 个周期，继续放宽")
+    return None
+
+
 def tune_from_record(inst: Scpi, ch: int, wave: dict, level: float, args) -> None:
     """用已读取的记录调量程和时基；下一次采集再验证调整效果。"""
     if not getattr(args, "no_autoscale", False):
@@ -1132,7 +1168,10 @@ def tune_from_record(inst: Scpi, ch: int, wave: dict, level: float, args) -> Non
         return
     freq = estimate_frequency(wave["values"], wave["dt_s"], level)
     if freq is None:
-        print("  当前记录不足两个周期，无法自动估算时基；保留原时基")
+        print("  当前记录不足两个周期，按 10 倍步进放宽时基寻找波形…")
+        freq = seek_timebase_for_period(inst, ch, args)
+    if freq is None:
+        print("  仍未找到可测周期的视图，保留原时基")
         return
     screen_periods = max(int(getattr(args, "screen_periods", 10) or 0),
                          int(getattr(args, "stable_periods", 10) or 0) + 2)
